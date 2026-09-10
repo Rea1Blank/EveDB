@@ -19,6 +19,5 @@ Keep closely related code in modules first. Add separate crates for storage,
 protocols, or a server when their interfaces and dependency boundaries become
 concrete. Keep benchmarks and integration tests beside the components they test.
 
-Before implementing the engine, decide the data model, persistence and recovery
-requirements, transaction guarantees, and whether the first interface is
-embedded, client/server, or both. Record consequential decisions in this folder.
+The [product description](product.md) covers the entity model, operations API,
+versioned history, replay, and standalone server experience.

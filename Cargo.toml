@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/evedb-core", "crates/evedb-cli"]
+members = ["src/evedb-core", "src/evedb-cli"]
 resolver = "3"
 
 [workspace.package]
@@ -11,7 +11,7 @@ repository = "https://github.com/Rea1Blank/EveDB"
 publish = false
 
 [workspace.dependencies]
-evedb-core = { path = "crates/evedb-core" }
+evedb-core = { path = "src/evedb-core" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

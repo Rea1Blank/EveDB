@@ -1,9 +1,18 @@
 # EveDB
 
-A database project written in Rust, developed in a single Cargo workspace.
+EveDB is a general-purpose database with built-in event sourcing for typed
+entities. It stores changes as events, maintains current state, and provides
+historical reads and replay through a small operations API.
 
-**Status:** initial scaffold. No storage engine, query language, transactions,
-or network service is implemented yet.
+Create an entity, submit new field values, and read the state you need.
+EveDB handles event history, versions, snapshots, and reconstruction with
+minimal configuration.
+
+Read the [product description](docs/product.md) for the data model, operations,
+entity lifecycle, transactions, and history retention.
+
+**Implementation status:** scaffold only; the database features described above
+are not implemented yet.
 
 ## Quick start
 
@@ -22,8 +31,8 @@ cargo run --locked -p evedb-cli -- --version
 
 | Path | Purpose |
 | --- | --- |
-| `crates/evedb-core` | Core library; future home of the database engine |
-| `crates/evedb-cli` | `evedb` command-line executable |
+| `src/evedb-core` | Core library; future home of the database engine |
+| `src/evedb-cli` | `evedb` command-line executable |
 | `docs` | Architecture and development decisions |
 | `legal` | Contributor agreement and licensing guidance |
 | `.github` | CI, contribution checks, and repository ownership |
