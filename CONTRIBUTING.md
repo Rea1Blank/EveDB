@@ -17,6 +17,10 @@ cargo doc --workspace --no-deps --locked
 
 Commit Cargo.lock. The current scaffold has no third-party Rust dependencies.
 
+Use the SPDX identifier `AGPL-3.0-only` in first-party Rust source headers.
+The public license permits commercial use; the CLA remains a separate
+contribution requirement. See [licensing guidance](legal/LICENSING.md).
+
 ## CLA
 
 Before a contribution can merge, each human author must complete the

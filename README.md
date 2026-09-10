@@ -55,15 +55,14 @@ signatures. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-EveDB is **source-available** under the
-[PolyForm Noncommercial License 1.0.0](LICENSE). It is not OSI open source.
-Uses outside the purposes permitted by that license require a separate written
-commercial license from the project owner, the individual operating
-[@Rea1Blank](https://github.com/Rea1Blank).
+EveDB is open-source software licensed under the
+[GNU Affero General Public License version 3 only](LICENSE)
+(`AGPL-3.0-only`). Commercial use is permitted.
 
-Running EveDB as a commercial network service is not exempt merely because no
-binary is distributed. Publishing source code alone does not grant permission
-for commercial use. The license defines the permitted purposes, including its
-specific provisions for noncommercial organizations.
+If you modify EveDB and make that version available to users over a network,
+you must offer those users its Corresponding Source under the AGPL.
+Distributing binaries also carries source-availability obligations, even
+without modifications. Independent applications are not automatically covered
+merely because they communicate with EveDB over a network.
 
 See [licensing guidance](legal/LICENSING.md) and [NOTICE](NOTICE).
