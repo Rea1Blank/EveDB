@@ -5,7 +5,7 @@
 use std::process::Command;
 
 #[test]
-fn help_and_no_arguments_describe_the_scaffold() {
+fn help_and_no_arguments_describe_the_engine() {
     for args in [vec![], vec!["--help"], vec!["-h"]] {
         let output = Command::new(env!("CARGO_BIN_EXE_evedb"))
             .args(args)
@@ -14,9 +14,50 @@ fn help_and_no_arguments_describe_the_scaffold() {
         assert!(output.status.success());
         let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
         assert!(stdout.contains("Usage: evedb"));
-        assert!(stdout.contains("not implemented yet"));
+        assert!(stdout.contains("checkpoint"));
+        assert!(stdout.contains("Experimental"));
         assert!(output.stderr.is_empty());
     }
+}
+
+#[test]
+fn database_commands_initialize_inspect_and_checkpoint() {
+    let path = std::env::temp_dir().join(format!("evedb-cli-{}", std::process::id()));
+    assert!(!path.exists(), "test directory must be unused");
+    let run = |command| {
+        Command::new(env!("CARGO_BIN_EXE_evedb"))
+            .arg(command)
+            .arg(&path)
+            .output()
+            .unwrap()
+    };
+    // Read/maintenance commands must not silently initialize a mistyped path.
+    assert!(!run("inspect").status.success());
+    assert!(!run("checkpoint").status.success());
+    assert!(!path.exists());
+    assert!(run("init").status.success());
+    {
+        let mut db = evedb_core::Database::open(&path).unwrap();
+        let schema = evedb_core::Schema::new(vec![evedb_core::Field {
+            id: 1,
+            name: "value".into(),
+            data_type: evedb_core::DataType::Int64,
+            nullable: false,
+        }])
+        .unwrap();
+        db.create_table("items", schema).unwrap();
+    }
+    let output = run("inspect");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Transaction sequence: 1"));
+    assert!(stdout.contains("1: items (schema 1, 1 fields)"));
+    assert!(run("checkpoint").status.success());
+    assert!(run("init").status.success());
+    assert!(run("inspect").status.success());
+    let canonical = path.canonicalize().unwrap();
+    assert!(canonical.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    std::fs::remove_dir_all(canonical).unwrap();
 }
 
 #[test]

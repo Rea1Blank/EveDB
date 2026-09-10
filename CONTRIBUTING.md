@@ -15,7 +15,7 @@ cargo test --workspace --all-features --locked
 cargo doc --workspace --no-deps --locked
 ```
 
-Commit Cargo.lock. The current scaffold has no third-party Rust dependencies.
+Commit Cargo.lock. The current engine has no third-party Rust dependencies.
 
 Use the SPDX identifier `AGPL-3.0-only` in first-party Rust source headers.
 The public license permits commercial use; the CLA remains a separate
