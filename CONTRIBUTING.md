@@ -4,6 +4,35 @@ Use English for code, documentation, issues, pull requests, and commit messages.
 Discuss substantial changes in an issue before implementation. Keep each pull
 request focused and describe how the resulting behavior was checked.
 
+## Branches
+
+Every branch must start with one of these prefixes, followed by a slash and a
+free-form description:
+
+| Prefix | Use |
+| --- | --- |
+| `feature/` | New behavior a user can observe. |
+| `fix/` | Correcting a defect in existing behavior. |
+| `perf/` | Same behavior, measurably less time or space. |
+| `refactor/` | Restructuring with no change in behavior. |
+| `test/` | Tests only. |
+| `docs/` | Documentation only. |
+| `ci/` | Workflows, rulesets, and repository automation. |
+| `build/` | Toolchain, Cargo configuration, and build settings. |
+| `deps/` | Dependency changes made by hand. |
+| `security/` | Vulnerability fixes and hardening. |
+| `release/` | Preparing a version. |
+| `chore/` | Routine work that fits none of the above. |
+
+Nothing after the prefix is checked, so `feature/wal-group-commit` and
+`fix/42-checkpoint-double-descend` are both fine. Pick the prefix that matches
+the change, not the file that happens to be largest in the diff.
+
+Only `main` and Dependabot's own branches are exempt. Open pull requests from a
+prefixed branch rather than from your fork's default branch. The `Branch name`
+check reports a rejected name and prints the commands to rename the branch; a
+ruleset enforces the same policy on pushes to this repository.
+
 ## Local checks
 
 Install Rust through rustup; the repository pins the toolchain.
@@ -71,7 +100,11 @@ verified before publishing a release.
 ## Review and merge
 
 Open a branch and pull request against main. All CI checks and the
-`Contribution policy` check must pass. The policy workflow reads the registry
+`Contribution policy` check must pass. A pull request also receives one
+comment comparing the storage benchmark against the base commit; it is a
+single run per commit on a shared runner, so treat it as a hint to measure
+locally rather than as a result, and never as a reason to block a merge. See
+[the benchmark notes](docs/storage-benchmarks.md). The policy workflow reads the registry
 from the default branch and checks commit authors, coauthors, sign-offs, and
 GitHub signature verification without checking out or running pull request code.
 

@@ -1,0 +1,76 @@
+name: Benchmark comment
+
+on:
+  workflow_run:
+    workflows: [Benchmark]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+
+concurrency:
+  group: benchmark-comment-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish the benchmark comparison
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # This workflow holds a write token, so it checks out the default branch
+      # and never the pull request's code. The measured numbers arrive only as
+      # data, in an artifact that is validated before it is rendered.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Download the comparison
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: storage-benchmark
+          path: comparison
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { readFileSync } = require('node:fs');
+            const { MARKER, render, validate } = require('./.github/scripts/benchmark-render.cjs');
+            const repo = context.repo;
+            const run = context.payload.workflow_run;
+            const report = validate(JSON.parse(readFileSync('comparison/report.json', 'utf8')));
+            if (report.head_sha !== run.head_sha) {
+              throw new Error('The report does not describe the commit that was measured');
+            }
+            const { data: pr } = await github.rest.pulls.get({
+              ...repo, pull_number: report.pull_request
+            });
+            // A report names its own pull request, so confirm that pull request
+            // really is the one whose head commit this run measured.
+            if (pr.head.sha !== run.head_sha) {
+              core.info('The pull request moved on; discarding a stale comparison');
+              return;
+            }
+            if (pr.base.sha !== report.base_sha) {
+              throw new Error('The report does not describe the pull request base');
+            }
+            if (pr.state !== 'open') return;
+            const body = `${MARKER}\n${render(report)}`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...repo, issue_number: report.pull_request, per_page: 100
+            });
+            const existing = comments.find(comment =>
+              comment.user?.type === 'Bot' && comment.body?.startsWith(MARKER));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({
+                ...repo, issue_number: report.pull_request, body
+              });
+            }

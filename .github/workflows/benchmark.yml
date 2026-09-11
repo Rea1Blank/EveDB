@@ -1,0 +1,63 @@
+name: Benchmark
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  storage:
+    name: Storage benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BENCH_ROWS: 10000
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: head
+          persist-credentials: false
+      - name: Check out the base commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+      - name: Install pinned toolchain
+        working-directory: head
+        run: rustup show active-toolchain
+      # A base commit without the example, or a base run that fails, still
+      # leaves a usable single-column report for this branch.
+      - name: Measure the base commit
+        continue-on-error: true
+        working-directory: base
+        run: |
+          cargo run --release --locked -p evedb-core --example storage_bench \
+            -- "$RUNNER_TEMP/base-db" "$BENCH_ROWS" | tee "$RUNNER_TEMP/base.txt"
+      - name: Measure this branch
+        working-directory: head
+        run: |
+          cargo run --release --locked -p evedb-core --example storage_bench \
+            -- "$RUNNER_TEMP/head-db" "$BENCH_ROWS" | tee "$RUNNER_TEMP/head.txt"
+      - name: Compare the two runs
+        working-directory: head
+        env:
+          BENCH_PULL_REQUEST: ${{ github.event.pull_request.number }}
+          BENCH_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BENCH_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          node .github/scripts/benchmark-report.cjs \
+            "$RUNNER_TEMP/base.txt" "$RUNNER_TEMP/head.txt" "$RUNNER_TEMP/benchmark/report.json"
+      - name: Upload the comparison
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: storage-benchmark
+          path: ${{ runner.temp }}/benchmark
+          if-no-files-found: error
+          retention-days: 7

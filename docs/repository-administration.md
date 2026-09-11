@@ -8,7 +8,8 @@ GitHub settings; the repository owner must apply and verify them.
 
 - Pull requests are required, including for the owner.
 - Commits entering main require GitHub-verified signatures.
-- Quality, all three platform test jobs, and Contribution policy must pass.
+- Branch name, Quality, all three platform test jobs, and Contribution policy
+  must pass.
 - Required checks must come from the GitHub Actions app.
 - Branches must be up to date and review threads resolved.
 - Force pushes and deletion are blocked; no bypass actors are configured.
@@ -22,6 +23,36 @@ are disabled to preserve reviewed commits and their signatures. GitHub web
 commits require sign-offs. Ensure merge commits also have a sign-off; when
 merging locally, use `git merge --no-ff -S --signoff` and preserve the reviewed
 head. Automatic branch deletion after merge is enabled.
+
+## Branch names
+
+`branch-names.json` requires every branch to begin with one of the approved
+prefixes listed in [CONTRIBUTING](../CONTRIBUTING.md); anything after the
+prefix is free-form. The default branch and `dependabot/**` are excluded, so
+dependency update branches keep working. Import this ruleset alongside the
+others; without it, only the pull request check applies.
+
+That pattern is the single source of truth. `.github/scripts/branch-name.cjs`
+reads it and repeats the decision in the `Branch name` job, which covers pull
+requests from forks that a repository ruleset cannot reach. Changing the
+approved prefixes means editing the ruleset pattern, updating the table in
+CONTRIBUTING, and updating `.github/tests/branch-name.test.cjs`, which asserts
+the recorded set. The ruleset remains the enforcement; the job only reports.
+
+## Benchmark comparisons
+
+`Benchmark` measures the storage example on the pull request and on its base
+commit with a read-only token, and uploads the comparison as an artifact.
+`Benchmark comment` then runs on `workflow_run`, holds `pull-requests: write`,
+checks out only the default branch, and renders one sticky comment. It never
+checks out or executes pull request code; the measured numbers reach it as
+data, and `.github/scripts/benchmark-render.cjs` validates every field before
+it becomes comment text.
+
+A report names the pull request it belongs to, so the workflow confirms that
+pull request's head commit is the one that was measured and discards a stale
+comparison. Neither workflow is a required status check: one run per commit on
+a shared runner is too noisy to gate a merge.
 
 ## Releases and security
 
