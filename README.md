@@ -16,7 +16,8 @@ tables, atomic cross-table transactions, indexed current/history reads, replay,
 snapshots, retention, incremental checkpoints that collect the generations they
 outgrow, and WAL/checkpoint recovery. The server and network API
 remain future work. Disk formats are not stable or production-qualified. See the
-[storage design and limits](docs/storage.md).
+[storage design and limits](docs/storage.md). [ROADMAP.md](ROADMAP.md) records
+the architectural decisions behind that engine and what comes next.
 
 ## Quick start
 
