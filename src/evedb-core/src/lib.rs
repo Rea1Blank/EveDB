@@ -14,6 +14,7 @@ mod database;
 mod error;
 mod model;
 mod reader;
+mod resources;
 mod shared;
 mod snapshot;
 #[cfg(test)]
@@ -21,6 +22,7 @@ mod test_support;
 
 pub use database::{Database, Options, Transaction};
 pub use reader::{ReadSnapshot, Reader, SnapshotStats};
+pub use resources::{Limits, ResourceUsage};
 pub use shared::{IsolationLevel, SharedDatabase, TransactionOptions};
 
 pub use error::{Error, Result};

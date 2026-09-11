@@ -7,6 +7,7 @@ use crate::{
     error::corrupt,
     model::*,
     reader::{ReadState, ReaderShared},
+    resources::{Permit, Reservation, Resources, check},
     snapshot::{self, Root, TableWriter},
     storage::{
         frame, heap,
@@ -27,6 +28,8 @@ use std::{
 /// Configuration for checkpointing and automatic history maintenance.
 #[derive(Clone, Debug)]
 pub struct Options {
+    /// Admission and mutation retention budgets.
+    pub limits: crate::Limits,
     /// Start a checkpoint before the next transaction after this WAL size.
     pub checkpoint_bytes: u64,
     /// Target size of a history segment; one large event may exceed it.
@@ -64,6 +67,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            limits: crate::Limits::default(),
             checkpoint_bytes: 8 * 1024 * 1024,
             history_segment_bytes: 8 * 1024 * 1024,
             snapshot_interval: 32,
@@ -118,6 +122,7 @@ impl Database {
     /// an error. If a checkpoint is damaged, the retained preceding checkpoint
     /// and WAL are used to reconstruct the committed state.
     pub fn open_with_options(path: impl AsRef<Path>, options: Options) -> Result<Self> {
+        options.limits.validate()?;
         if options.checkpoint_bytes < 4096 || options.history_segment_bytes < 4096 {
             return Err(Error::Invalid(
                 "checkpoint and segment targets must be at least 4096 bytes".into(),
@@ -203,6 +208,8 @@ impl Database {
             lsn: root.lsn,
             root: Arc::new(root),
             overlay: BTreeMap::new(),
+            resources: Resources::new(options.limits.clone()),
+            charges: Vec::new(),
             pager: Arc::new(pager),
             _lock: Arc::new(lock),
             poisoned: Arc::new(AtomicBool::new(false)),
@@ -236,7 +243,7 @@ impl Database {
                     if db.state.lsn.checked_add(1) != Some(record.lsn) {
                         return Err(corrupt("gap or duplicate in transaction sequence"));
                     }
-                    let mut tx = Transaction::new(&mut db);
+                    let mut tx = Transaction::new(&mut db, true)?;
                     for op in decode_ops(&record.payload)? {
                         tx.run(op)
                             .map_err(|e| corrupt(format!("invalid WAL operation: {e}")))?;
@@ -267,6 +274,10 @@ impl Database {
             Ok(())
         }
     }
+    /// Returns current admission counters.
+    pub fn resource_usage(&self) -> crate::ResourceUsage {
+        self.state.resources.usage()
+    }
     /// Returns the last committed transaction sequence number.
     pub fn sequence(&self) -> u64 {
         self.state.lsn
@@ -287,7 +298,7 @@ impl Database {
         {
             self.checkpoint()?;
         }
-        Ok(Transaction::new(self))
+        Transaction::new(self, false)
     }
     /// Runs and commits a group of operations, discarding all of them on error.
     pub fn write<T>(
@@ -589,6 +600,7 @@ impl Database {
         let previous = std::mem::replace(&mut state.root, Arc::new(root));
         self.wal = wal;
         Arc::make_mut(&mut self.state).overlay.clear();
+        Arc::make_mut(&mut self.state).charges.clear();
         self.readers.publish(self.state.clone());
         // Publication succeeded: cleanup errors do not invalidate acknowledged commits.
         let mut keep: BTreeSet<_> = previous
@@ -648,6 +660,8 @@ impl Database {
 /// A staged transaction. Any failed write operation prevents its commit.
 pub struct Transaction<'a> {
     target: CommitTarget<'a>,
+    _permit: Option<Permit>,
+    reservation: Reservation,
     base: Arc<ReadState>,
     options: Options,
     catalog: BTreeMap<TableId, Table>,
@@ -656,8 +670,21 @@ pub struct Transaction<'a> {
     failed: bool,
 }
 impl<'a> Transaction<'a> {
-    fn new(db: &'a mut Database) -> Self {
-        Self {
+    fn new(db: &'a mut Database, recovery: bool) -> Result<Self> {
+        let permit = if recovery {
+            None
+        } else {
+            Some(db.state.resources.transaction()?)
+        };
+        let mut reservation = db.state.resources.reservation();
+        if recovery {
+            reservation.recover(8);
+        } else {
+            reservation.grow(8)?;
+        }
+        Ok(Self {
+            _permit: permit,
+            reservation,
             catalog: (*db.state.catalog).clone(),
             base: db.state.clone(),
             options: db.options.clone(),
@@ -665,7 +692,7 @@ impl<'a> Transaction<'a> {
             staged: BTreeMap::new(),
             operations: Vec::new(),
             failed: false,
-        }
+        })
     }
     /// Creates a table. Schema version must be one.
     pub fn create_table(&mut self, name: &str, schema: Schema) -> Result<TableId> {
@@ -772,7 +799,27 @@ impl<'a> Transaction<'a> {
                 "transaction was aborted by an earlier operation".into(),
             ));
         }
-        let result = self.execute(&operation);
+        let bytes = operation.encoded_len();
+        let result = (|| {
+            if self._permit.is_some() {
+                check(
+                    "transaction operations",
+                    self.operations.len(),
+                    1,
+                    self.options.limits.max_transaction_operations,
+                )?;
+                check(
+                    "transaction bytes",
+                    self.reservation.bytes,
+                    bytes,
+                    self.options.limits.max_transaction_bytes,
+                )?;
+                self.reservation.grow(bytes)?;
+            } else {
+                self.reservation.recover(bytes);
+            }
+            self.execute(&operation)
+        })();
         if result.is_err() {
             self.failed = true;
         } else {
@@ -877,6 +924,7 @@ impl<'a> Transaction<'a> {
             ));
         }
         let batch = Prepared {
+            reservation: self.reservation,
             base_sequence: self.base.lsn,
             catalog: self.catalog,
             staged: self.staged,
@@ -893,6 +941,7 @@ impl<'a> Transaction<'a> {
             unreachable!("local recovery")
         };
         Prepared {
+            reservation: self.reservation,
             base_sequence: self.base.lsn,
             catalog: self.catalog,
             staged: self.staged,
@@ -902,9 +951,14 @@ impl<'a> Transaction<'a> {
     }
 }
 impl Transaction<'static> {
-    pub(crate) fn shared(db: SharedDatabase, pin: ReadSnapshot, options: Options) -> Self {
+    pub(crate) fn shared(db: SharedDatabase, pin: ReadSnapshot, options: Options) -> Result<Self> {
         let base = pin.state().clone();
-        Self {
+        let permit = base.resources.transaction()?;
+        let mut reservation = base.resources.reservation();
+        reservation.grow(8)?;
+        Ok(Self {
+            _permit: Some(permit),
+            reservation,
             catalog: (*base.catalog).clone(),
             base,
             options,
@@ -912,7 +966,7 @@ impl Transaction<'static> {
             staged: BTreeMap::new(),
             operations: Vec::new(),
             failed: false,
-        }
+        })
     }
 }
 enum CommitTarget<'a> {
@@ -923,6 +977,7 @@ enum CommitTarget<'a> {
     },
 }
 pub(crate) struct Prepared {
+    reservation: Reservation,
     pub base_sequence: u64,
     catalog: BTreeMap<TableId, Table>,
     staged: BTreeMap<(TableId, u64), EntityData>,
@@ -988,6 +1043,7 @@ impl Prepared {
     }
     fn publish(self, db: &mut Database, lsn: u64) {
         let state = Arc::make_mut(&mut db.state);
+        state.charges.push(Arc::new(self.reservation));
         state.catalog = Arc::new(self.catalog);
         state.overlay.extend(
             self.staged
@@ -1009,6 +1065,24 @@ enum Operation {
     Snapshot(u64, u64),
 }
 impl Operation {
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Table(table) => {
+                1 + 24
+                    + table.name.len()
+                    + table
+                        .schemas
+                        .iter()
+                        .map(|s| 16 + s.fields.iter().map(|f| 14 + f.name.len()).sum::<usize>())
+                        .sum::<usize>()
+            }
+            Self::Create(_, _, fields) | Self::Apply(_, _, fields) => {
+                17 + fields_encoded_len(fields)
+            }
+            Self::Retain(..) => 25,
+            Self::Delete(..) | Self::Snapshot(..) => 17,
+        }
+    }
     fn entity_key(&self) -> Option<(u64, u64)> {
         match self {
             Self::Table(_) => None,

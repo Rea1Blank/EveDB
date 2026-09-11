@@ -75,6 +75,12 @@ Steps 1–3 are implemented. See [concurrent transactions](docs/transactions.md)
 for the API, exact guarantees, failure semantics, and remaining limits. Step 4
 is next; no production throughput SLO has been qualified yet.
 
+The next authorized implementation series is detailed in
+[write-path implementation](docs/write-path.md): budgets, deadlines, staging,
+shared overlay, group commit, and independent history storage. External metrics
+and the load harness are deferred to a separate workstream rather than gating
+this series. Resource-accounting counters and correctness tests are still required.
+
 | Step | Deliverable | Acceptance gate |
 | --- | --- | --- |
 | 1 | Product requirements and architectural contracts | Deferred capabilities and current limitations are explicit. |
