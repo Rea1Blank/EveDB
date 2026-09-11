@@ -30,8 +30,17 @@ pub(crate) struct ReadState {
     pub resources: Arc<Resources>,
     pub charges: Vec<Arc<Reservation>>,
     pub pager: Arc<Pager>,
-    pub _lock: Arc<File>,
+    pub _lock: Arc<DirectoryLock>,
     pub poisoned: Arc<AtomicBool>,
+}
+// Closing one descriptor is insufficient on Unix if a concurrently spawned
+// process still holds an inherited copy before exec. Release the lock when the
+// last engine owner (including its pinned readers) goes away.
+pub(crate) struct DirectoryLock(pub File);
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 impl ReadState {
     pub(crate) fn ready(&self) -> Result<()> {
