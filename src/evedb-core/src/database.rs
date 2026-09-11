@@ -4,9 +4,10 @@ use crate::{
     Entity, Error, Event, EventKind, Fields, ReadSnapshot, Result, Schema, SharedDatabase, Table,
     TableId,
     codec::{Decoder, Encoder},
+    deadline::{self, Lease},
     error::corrupt,
     model::*,
-    reader::{ReadState, ReaderShared},
+    reader::{ReadState, ReaderShared, SnapshotData},
     resources::{Permit, Reservation, Resources, check},
     snapshot::{self, Root, TableWriter},
     storage::{
@@ -28,6 +29,8 @@ use std::{
 /// Configuration for checkpointing and automatic history maintenance.
 #[derive(Clone, Debug)]
 pub struct Options {
+    /// Transaction, snapshot, operation and commit-admission deadlines.
+    pub timeouts: crate::Timeouts,
     /// Admission and mutation retention budgets.
     pub limits: crate::Limits,
     /// Start a checkpoint before the next transaction after this WAL size.
@@ -68,6 +71,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             limits: crate::Limits::default(),
+            timeouts: crate::Timeouts::default(),
             checkpoint_bytes: 8 * 1024 * 1024,
             history_segment_bytes: 8 * 1024 * 1024,
             snapshot_interval: 32,
@@ -123,6 +127,7 @@ impl Database {
     /// and WAL are used to reconstruct the committed state.
     pub fn open_with_options(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         options.limits.validate()?;
+        options.timeouts.validate()?;
         if options.checkpoint_bytes < 4096 || options.history_segment_bytes < 4096 {
             return Err(Error::Invalid(
                 "checkpoint and segment targets must be at least 4096 bytes".into(),
@@ -208,7 +213,7 @@ impl Database {
             lsn: root.lsn,
             root: Arc::new(root),
             overlay: BTreeMap::new(),
-            resources: Resources::new(options.limits.clone()),
+            resources: Resources::new(options.limits.clone(), options.timeouts.clone())?,
             charges: Vec::new(),
             pager: Arc::new(pager),
             _lock: Arc::new(lock),
@@ -243,12 +248,13 @@ impl Database {
                     if db.state.lsn.checked_add(1) != Some(record.lsn) {
                         return Err(corrupt("gap or duplicate in transaction sequence"));
                     }
-                    let mut tx = Transaction::new(&mut db, true)?;
+                    let tx = Transaction::new(&mut db, true, crate::TransactionOptions::default())?;
                     for op in decode_ops(&record.payload)? {
-                        tx.run(op)
+                        tx.data
+                            .with(|data| data.run(op))
                             .map_err(|e| corrupt(format!("invalid WAL operation: {e}")))?;
                     }
-                    tx.publish(record.lsn);
+                    tx.publish(record.lsn)?;
                 }
                 complete_end = file.stream_position()?;
             }
@@ -292,13 +298,23 @@ impl Database {
     }
     /// Starts an isolated write transaction. Dropping it discards staged operations.
     pub fn transaction(&mut self) -> Result<Transaction<'_>> {
+        self.transaction_with_options(crate::TransactionOptions::default())
+    }
+    /// Starts a local transaction with explicit isolation and optional shorter deadlines.
+    pub fn transaction_with_options(
+        &mut self,
+        requested: crate::TransactionOptions,
+    ) -> Result<Transaction<'_>> {
+        if requested.isolation != crate::IsolationLevel::Snapshot {
+            return Err(Error::UnsupportedIsolation(requested.isolation));
+        }
         self.ready()?;
         if self.wal.metadata()?.len() >= self.options.checkpoint_bytes
             && self.state.lsn > self.state.root.lsn
         {
             self.checkpoint()?;
         }
-        Transaction::new(self, false)
+        Transaction::new(self, false, requested)
     }
     /// Runs and commits a group of operations, discarding all of them on error.
     pub fn write<T>(
@@ -328,27 +344,27 @@ impl Database {
     }
     /// See [`Database::get`](crate::Database::get); uses one committed view per call.
     pub fn get(&self, table: TableId, id: u64) -> Result<Option<Entity>> {
-        self.state.get(table, id)
+        self.reader().get(table, id)
     }
     /// See [`Database::get_at_version`](crate::Database::get_at_version); uses one committed view per call.
     pub fn get_at_version(&self, table: TableId, id: u64, version: u64) -> Result<Entity> {
-        self.state.get_at_version(table, id, version)
+        self.reader().get_at_version(table, id, version)
     }
     /// See [`Database::replay`](crate::Database::replay); uses one committed view per call.
     pub fn replay(&self, table: TableId, id: u64) -> Result<Entity> {
-        self.state.replay(table, id)
+        self.reader().replay(table, id)
     }
     /// See [`Database::replay_to_version`](crate::Database::replay_to_version); uses one committed view per call.
     pub fn replay_to_version(&self, table: TableId, id: u64, version: u64) -> Result<Entity> {
-        self.state.replay_to_version(table, id, version)
+        self.reader().replay_to_version(table, id, version)
     }
     /// See [`Database::events`](crate::Database::events); uses one committed view per call.
     pub fn events(&self, table: TableId, id: u64) -> Result<Vec<Event>> {
-        self.state.events(table, id)
+        self.reader().events(table, id)
     }
     /// See [`Database::retained_range`](crate::Database::retained_range); uses one committed view per call.
     pub fn retained_range(&self, table: TableId, id: u64) -> Result<(u64, u64)> {
-        self.state.retained_range(table, id)
+        self.reader().retained_range(table, id)
     }
     /// Retains the latest N events and atomically advances the retained base.
     pub fn retain_last(&mut self, table: TableId, id: u64, count: usize) -> Result<()> {
@@ -356,7 +372,7 @@ impl Database {
     }
     /// Visits live entities in ID order using one committed view.
     pub fn scan(&self, table: TableId, visit: impl FnMut(Entity) -> Result<()>) -> Result<()> {
-        self.state.scan(table, visit)
+        self.reader().scan(table, visit)
     }
     fn load(&self, table: TableId, id: u64) -> Result<Option<EntityData>> {
         self.state.load(table, id)
@@ -657,42 +673,196 @@ impl Database {
     }
 }
 
-/// A staged transaction. Any failed write operation prevents its commit.
+/// An independently staged transaction with cooperative deadlines.
 pub struct Transaction<'a> {
     target: CommitTarget<'a>,
-    _permit: Option<Permit>,
-    reservation: Reservation,
+    data: Arc<Lease<Staging>>,
+}
+impl<'a> Transaction<'a> {
+    fn new(
+        db: &'a mut Database,
+        recovery: bool,
+        requested: crate::TransactionOptions,
+    ) -> Result<Self> {
+        let base = db.state.clone();
+        let data = Staging::new(base.clone(), db.options.clone(), None, recovery)?;
+        let timeouts = &db.options.timeouts;
+        let data = Lease::new(
+            data,
+            &base.resources.reaper,
+            (!recovery).then_some(
+                requested
+                    .timeout
+                    .map_or(timeouts.transaction, |t| t.min(timeouts.transaction)),
+            ),
+            (!recovery).then_some(
+                requested
+                    .idle_timeout
+                    .map_or(timeouts.idle_transaction, |t| {
+                        t.min(timeouts.idle_transaction)
+                    }),
+            ),
+            (!recovery).then_some(timeouts.operation),
+        )?;
+        Ok(Self {
+            target: CommitTarget::Local(db),
+            data,
+        })
+    }
+    /// Creates a table.
+    pub fn create_table(&mut self, name: &str, schema: Schema) -> Result<TableId> {
+        self.data.with(|data| data.create_table(name, schema))
+    }
+    /// Renames a table.
+    pub fn rename_table(&mut self, id: TableId, name: &str) -> Result<()> {
+        self.data.with(|data| data.rename_table(id, name))
+    }
+    /// Adds a compatible schema version.
+    pub fn alter_table(&mut self, id: TableId, fields: Vec<crate::Field>) -> Result<()> {
+        self.data.with(|data| data.alter_table(id, fields))
+    }
+    /// Creates an entity.
+    pub fn create(&mut self, table: TableId, id: u64, fields: Fields) -> Result<()> {
+        self.data.with(|data| data.create(table, id, fields))
+    }
+    /// Applies field assignments.
+    pub fn apply(&mut self, table: TableId, id: u64, fields: Fields) -> Result<()> {
+        self.data.with(|data| data.apply(table, id, fields))
+    }
+    /// Deletes an entity while preserving its history.
+    pub fn delete(&mut self, table: TableId, id: u64) -> Result<()> {
+        self.data.with(|data| data.delete(table, id))
+    }
+    /// Retains the last N events.
+    pub fn retain_last(&mut self, table: TableId, id: u64, count: usize) -> Result<()> {
+        self.data.with(|data| data.retain_last(table, id, count))
+    }
+    /// Stages an acceleration snapshot.
+    pub fn snapshot(&mut self, table: TableId, id: u64) -> Result<()> {
+        self.data.with(|data| data.snapshot(table, id))
+    }
+    /// Reads the pinned view plus own writes.
+    pub fn get(&self, table: TableId, id: u64) -> Result<Option<Entity>> {
+        self.data.with(|data| data.get(table, id))
+    }
+    /// Commits before its admission deadline. After WAL writing starts, waits for
+    /// a definite result or an uncertain I/O outcome; OS synchronization is not interrupted.
+    pub fn commit(self) -> Result<u64> {
+        let data = self.data.take()?;
+        data.base.ready()?;
+        if data.failed {
+            return Err(Error::Invalid(
+                "cannot commit an aborted transaction".into(),
+            ));
+        }
+        let queue_end = deadline::deadline(data.options.timeouts.commit_queue)?;
+        let end = self
+            .data
+            .deadline
+            .map_or(queue_end, |end| end.min(queue_end));
+        let batch = data.prepare(Some(end));
+        match self.target {
+            CommitTarget::Local(db) => batch.commit(db),
+            CommitTarget::Shared(db) => db.commit(batch),
+        }
+    }
+    fn publish(self, lsn: u64) -> Result<()> {
+        let CommitTarget::Local(db) = self.target else {
+            unreachable!("local recovery")
+        };
+        self.data.take()?.prepare(None).publish(db, lsn);
+        Ok(())
+    }
+}
+impl Transaction<'static> {
+    pub(crate) fn shared(
+        db: SharedDatabase,
+        pin: ReadSnapshot,
+        options: Options,
+        requested: crate::TransactionOptions,
+    ) -> Result<Self> {
+        let retained = pin.state()?;
+        let base = retained.state.clone();
+        let timeouts = &options.timeouts;
+        let total = requested
+            .timeout
+            .map_or(timeouts.transaction, |t| t.min(timeouts.transaction));
+        let idle = requested
+            .idle_timeout
+            .map_or(timeouts.idle_transaction, |t| {
+                t.min(timeouts.idle_transaction)
+            });
+        let operation = timeouts.operation;
+        let data = Staging::new(base.clone(), options, Some(retained), false)?;
+        let data = Lease::new(
+            data,
+            &base.resources.reaper,
+            Some(total),
+            Some(idle),
+            Some(operation),
+        )?;
+        Ok(Self {
+            target: CommitTarget::Shared(db),
+            data,
+        })
+    }
+}
+enum CommitTarget<'a> {
+    Local(&'a mut Database),
+    Shared(SharedDatabase),
+}
+struct Staging {
     base: Arc<ReadState>,
     options: Options,
+    _pin: Option<Arc<SnapshotData>>,
+    _permit: Option<Permit>,
+    reservation: Reservation,
     catalog: BTreeMap<TableId, Table>,
     staged: BTreeMap<(TableId, u64), EntityData>,
     operations: Vec<Operation>,
     failed: bool,
 }
-impl<'a> Transaction<'a> {
-    fn new(db: &'a mut Database, recovery: bool) -> Result<Self> {
+impl Staging {
+    fn new(
+        base: Arc<ReadState>,
+        options: Options,
+        pin: Option<Arc<SnapshotData>>,
+        recovery: bool,
+    ) -> Result<Self> {
         let permit = if recovery {
             None
         } else {
-            Some(db.state.resources.transaction()?)
+            Some(base.resources.transaction()?)
         };
-        let mut reservation = db.state.resources.reservation();
+        let mut reservation = base.resources.reservation();
         if recovery {
             reservation.recover(8);
         } else {
             reservation.grow(8)?;
         }
         Ok(Self {
+            catalog: (*base.catalog).clone(),
+            base,
+            options,
+            _pin: pin,
             _permit: permit,
             reservation,
-            catalog: (*db.state.catalog).clone(),
-            base: db.state.clone(),
-            options: db.options.clone(),
-            target: CommitTarget::Local(db),
             staged: BTreeMap::new(),
             operations: Vec::new(),
             failed: false,
         })
+    }
+    fn prepare(self, deadline: Option<std::time::Instant>) -> Prepared {
+        Prepared {
+            base_sequence: self.base.lsn,
+            catalog: self.catalog,
+            staged: self.staged,
+            operations: self.operations,
+            reservation: self.reservation,
+            _permit: self._permit,
+            _pin: self._pin,
+            deadline,
+        }
     }
     /// Creates a table. Schema version must be one.
     pub fn create_table(&mut self, name: &str, schema: Schema) -> Result<TableId> {
@@ -913,70 +1083,11 @@ impl<'a> Transaction<'a> {
         self.staged.insert((table_id, id), data);
         Ok(())
     }
-    /// Commits the staged transaction. Shared writers validate dependencies first.
-    /// An I/O error after WAL writing starts has an unknown outcome and requires
-    /// recovery; a conflict is a definite abort and permits a whole-transaction retry.
-    pub fn commit(self) -> Result<u64> {
-        self.base.ready()?;
-        if self.failed {
-            return Err(Error::Invalid(
-                "cannot commit an aborted transaction".into(),
-            ));
-        }
-        let batch = Prepared {
-            reservation: self.reservation,
-            base_sequence: self.base.lsn,
-            catalog: self.catalog,
-            staged: self.staged,
-            operations: self.operations,
-        };
-        match self.target {
-            CommitTarget::Local(db) => batch.commit(db),
-            CommitTarget::Shared { db, pin } => db.commit(batch, pin),
-        }
-    }
-    fn publish(self, lsn: u64) {
-        // Recovery uses local staging without appending the WAL a second time.
-        let CommitTarget::Local(db) = self.target else {
-            unreachable!("local recovery")
-        };
-        Prepared {
-            reservation: self.reservation,
-            base_sequence: self.base.lsn,
-            catalog: self.catalog,
-            staged: self.staged,
-            operations: self.operations,
-        }
-        .publish(db, lsn);
-    }
-}
-impl Transaction<'static> {
-    pub(crate) fn shared(db: SharedDatabase, pin: ReadSnapshot, options: Options) -> Result<Self> {
-        let base = pin.state().clone();
-        let permit = base.resources.transaction()?;
-        let mut reservation = base.resources.reservation();
-        reservation.grow(8)?;
-        Ok(Self {
-            _permit: Some(permit),
-            reservation,
-            catalog: (*base.catalog).clone(),
-            base,
-            options,
-            target: CommitTarget::Shared { db, pin },
-            staged: BTreeMap::new(),
-            operations: Vec::new(),
-            failed: false,
-        })
-    }
-}
-enum CommitTarget<'a> {
-    Local(&'a mut Database),
-    Shared {
-        db: SharedDatabase,
-        pin: ReadSnapshot,
-    },
 }
 pub(crate) struct Prepared {
+    _permit: Option<Permit>,
+    _pin: Option<Arc<SnapshotData>>,
+    pub deadline: Option<std::time::Instant>,
     reservation: Reservation,
     pub base_sequence: u64,
     catalog: BTreeMap<TableId, Table>,
@@ -997,6 +1108,7 @@ impl Prepared {
     }
     pub fn commit(mut self, db: &mut Database) -> Result<u64> {
         db.ready()?;
+        deadline::check(self.deadline)?;
         if self.operations.is_empty() {
             return Ok(db.state.lsn);
         }
@@ -1020,6 +1132,7 @@ impl Prepared {
             }
         }
         let encoded = frame::encode(2, lsn, &encode_ops(&self.operations))?;
+        deadline::check(self.deadline)?;
         fault("wal-before-write");
         let result = (|| -> std::io::Result<()> {
             io_fault("before-write")?;

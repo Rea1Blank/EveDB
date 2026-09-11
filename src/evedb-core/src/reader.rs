@@ -2,6 +2,7 @@
 
 use crate::{
     Entity, Error, Event, Result, Table, TableId,
+    deadline::{self, Lease},
     error::corrupt,
     model::EntityData,
     resources::{Permit, Reservation, Resources},
@@ -39,18 +40,6 @@ impl ReadState {
         } else {
             Ok(())
         }
-    }
-    /// Returns the last committed transaction sequence number.
-    pub fn sequence(&self) -> u64 {
-        self.lsn
-    }
-    /// Lists table definitions in stable ID order.
-    pub fn tables(&self) -> impl Iterator<Item = &Table> {
-        self.catalog.values()
-    }
-    /// Resolves a table by its current name.
-    pub fn table(&self, name: &str) -> Option<&Table> {
-        self.catalog.values().find(|t| t.name == name)
     }
     /// Returns a live current entity without replaying its events.
     pub fn get(&self, table: TableId, id: u64) -> Result<Option<Entity>> {
@@ -204,13 +193,13 @@ impl ReadState {
     }
 }
 
-struct SnapshotPin {
+pub(crate) struct SnapshotData {
     _permit: Permit,
-    state: Arc<ReadState>,
+    pub state: Arc<ReadState>,
 }
 pub(crate) struct ReaderShared {
     pub current: RwLock<Arc<ReadState>>,
-    pins: Mutex<Vec<Weak<SnapshotPin>>>,
+    pins: Mutex<Vec<Weak<SnapshotData>>>,
 }
 impl ReaderShared {
     pub fn new(state: Arc<ReadState>) -> Self {
@@ -306,14 +295,27 @@ impl Reader {
                 limit: state.resources.limits.max_pinned_bytes,
             })?;
         let permit = state.resources.snapshot(bytes)?;
-        let pin = Arc::new(SnapshotPin {
+        let data = Arc::new(SnapshotData {
             _permit: permit,
             state: state.clone(),
         });
         let mut pins = self.shared.pins.lock().map_err(|_| Error::NeedsRecovery)?;
         pins.retain(|pin| pin.strong_count() != 0);
-        pins.push(Arc::downgrade(&pin));
-        Ok(ReadSnapshot { pin })
+        pins.push(Arc::downgrade(&data));
+        let catalog = state.catalog.clone();
+        let sequence = state.lsn;
+        let pin = Lease::new(
+            data,
+            &state.resources.reaper,
+            Some(state.resources.timeouts.snapshot),
+            None,
+            None,
+        )?;
+        Ok(ReadSnapshot {
+            pin,
+            catalog,
+            sequence,
+        })
     }
     /// Returns the last published sequence.
     pub fn sequence(&self) -> Result<u64> {
@@ -365,50 +367,70 @@ impl Reader {
 /// Snapshot isolation does not promise serializability with concurrent writers.
 #[derive(Clone)]
 pub struct ReadSnapshot {
-    pin: Arc<SnapshotPin>,
+    pin: Arc<Lease<Arc<SnapshotData>>>,
+    catalog: Arc<BTreeMap<TableId, Table>>,
+    sequence: u64,
 }
 impl ReadSnapshot {
-    pub(crate) fn state(&self) -> &Arc<ReadState> {
-        &self.pin.state
+    pub(crate) fn state(&self) -> Result<Arc<SnapshotData>> {
+        self.pin.with(|data| Ok(data.clone()))
+    }
+    fn with_state<R>(
+        &self,
+        operation: impl FnOnce(&ReadState, std::time::Instant) -> Result<R>,
+    ) -> Result<R> {
+        let data = self.state()?;
+        let end = deadline::deadline(data.state.resources.timeouts.operation)?;
+        let end = self.pin.deadline.map_or(end, |expiry| end.min(expiry));
+        deadline::check(Some(end))?;
+        let result = operation(&data.state, end);
+        deadline::check(Some(end))?;
+        result
     }
     /// Committed sequence captured by this snapshot.
     pub fn sequence(&self) -> u64 {
-        self.pin.state.sequence()
+        self.sequence
     }
     /// Table definitions as they existed at snapshot acquisition.
     pub fn tables(&self) -> impl Iterator<Item = &Table> {
-        self.pin.state.tables()
+        self.catalog.values()
     }
     /// Resolves a table using the pinned catalog.
     pub fn table(&self, name: &str) -> Option<&Table> {
-        self.pin.state.table(name)
+        self.catalog.values().find(|table| table.name == name)
     }
     /// See [`Database::get`](crate::Database::get); uses this pinned view.
     pub fn get(&self, table: TableId, id: u64) -> Result<Option<Entity>> {
-        self.pin.state.get(table, id)
+        self.with_state(|state, _| state.get(table, id))
     }
     /// See [`Database::get_at_version`](crate::Database::get_at_version); uses this pinned view.
     pub fn get_at_version(&self, table: TableId, id: u64, version: u64) -> Result<Entity> {
-        self.pin.state.get_at_version(table, id, version)
+        self.with_state(|state, _| state.get_at_version(table, id, version))
     }
     /// See [`Database::replay`](crate::Database::replay); uses this pinned view.
     pub fn replay(&self, table: TableId, id: u64) -> Result<Entity> {
-        self.pin.state.replay(table, id)
+        self.with_state(|state, _| state.replay(table, id))
     }
     /// See [`Database::replay_to_version`](crate::Database::replay_to_version); uses this pinned view.
     pub fn replay_to_version(&self, table: TableId, id: u64, version: u64) -> Result<Entity> {
-        self.pin.state.replay_to_version(table, id, version)
+        self.with_state(|state, _| state.replay_to_version(table, id, version))
     }
     /// See [`Database::events`](crate::Database::events); uses this pinned view.
     pub fn events(&self, table: TableId, id: u64) -> Result<Vec<Event>> {
-        self.pin.state.events(table, id)
+        self.with_state(|state, _| state.events(table, id))
     }
     /// See [`Database::retained_range`](crate::Database::retained_range); uses this pinned view.
     pub fn retained_range(&self, table: TableId, id: u64) -> Result<(u64, u64)> {
-        self.pin.state.retained_range(table, id)
+        self.with_state(|state, _| state.retained_range(table, id))
     }
     /// See [`Database::scan`](crate::Database::scan); uses this pinned view.
     pub fn scan(&self, table: TableId, visit: impl FnMut(Entity) -> Result<()>) -> Result<()> {
-        self.pin.state.scan(table, visit)
+        self.with_state(|state, end| {
+            let mut visit = visit;
+            state.scan(table, |entity| {
+                deadline::check(Some(end))?;
+                visit(entity)
+            })
+        })
     }
 }

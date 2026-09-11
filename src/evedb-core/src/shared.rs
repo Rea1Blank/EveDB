@@ -26,17 +26,60 @@ pub enum IsolationLevel {
     Serializable,
 }
 
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::{DataType, Field, Value, test_support::TempDir};
+    use std::time::Duration;
+
+    #[test]
+    fn waiting_commit_expires_without_writing_or_leaking_a_permit() {
+        let dir = TempDir::new();
+        let db = SharedDatabase::open(&dir.0).unwrap();
+        let table = db
+            .create_table(
+                "items",
+                Schema::new(vec![Field {
+                    id: 1,
+                    name: "value".into(),
+                    data_type: DataType::UInt64,
+                    nullable: false,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let requested = TransactionOptions {
+            timeout: Some(Duration::from_millis(40)),
+            ..TransactionOptions::default()
+        };
+        let mut tx = db.transaction_with_options(requested).unwrap();
+        tx.create(table, 1, [(1, Value::UInt64(1))].into()).unwrap();
+        let guard = db.coordinator.lock().unwrap();
+        assert!(matches!(tx.commit(), Err(Error::DeadlineExceeded)));
+        assert_eq!(db.resource_usage().transactions, 0);
+        drop(guard);
+        assert!(db.get(table, 1).unwrap().is_none());
+    }
+}
+
 /// Per-transaction policy, independent of storage/maintenance options.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TransactionOptions {
     /// Requested isolation. Defaults to Snapshot.
     pub isolation: IsolationLevel,
+    /// Optional shorter total lifetime than the database default.
+    pub timeout: Option<std::time::Duration>,
+    /// Optional shorter idle lifetime than the database default.
+    pub idle_timeout: Option<std::time::Duration>,
 }
 impl TransactionOptions {
     /// Requests an explicit isolation level.
     pub fn with_isolation(isolation: IsolationLevel) -> Self {
-        Self { isolation }
+        Self {
+            isolation,
+            ..Self::default()
+        }
     }
 }
 
@@ -57,7 +100,7 @@ struct Coordinator {
 pub struct SharedDatabase {
     coordinator: Arc<Mutex<Coordinator>>,
     reader: Reader,
-    options: Options,
+    options: Arc<Options>,
 }
 impl SharedDatabase {
     /// Opens a concurrent database with default storage options.
@@ -71,7 +114,7 @@ impl SharedDatabase {
     pub(crate) fn from_database(database: Database) -> Self {
         Self {
             reader: database.reader(),
-            options: database.options(),
+            options: Arc::new(database.options()),
             coordinator: Arc::new(Mutex::new(Coordinator {
                 database,
                 revisions: BTreeMap::new(),
@@ -92,7 +135,7 @@ impl SharedDatabase {
             return Err(Error::UnsupportedIsolation(options.isolation));
         }
         let pin = self.reader.pin()?;
-        Transaction::shared(self.clone(), pin, self.options.clone())
+        Transaction::shared(self.clone(), pin, (*self.options).clone(), options)
     }
     /// Runs a transaction without automatic retries. The closure may have side effects.
     pub fn write<T>(
@@ -168,8 +211,17 @@ impl SharedDatabase {
             .revisions
             .retain(|_, sequence| *sequence > oldest);
     }
-    pub(crate) fn commit(&self, batch: Prepared, _pin: ReadSnapshot) -> Result<u64> {
-        let mut coordinator = self.coordinator.lock().map_err(|_| Error::NeedsRecovery)?;
+    pub(crate) fn commit(&self, batch: Prepared) -> Result<u64> {
+        let mut coordinator = loop {
+            crate::deadline::check(batch.deadline)?;
+            match self.coordinator.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::NeedsRecovery),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1))
+                }
+            }
+        };
         coordinator.database.ready()?;
         if batch.is_empty() {
             return Ok(batch.base_sequence);

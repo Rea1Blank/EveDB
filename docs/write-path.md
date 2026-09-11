@@ -30,3 +30,25 @@ Recovery must not discard acknowledged writes because an operator lowered limits
 It reconstructs and charges committed mutations even above the admission budget;
 new transactions then fail until checkpointing releases enough charges. Recovery
 memory itself is not capped by the admission limit.
+
+## Deadlines and abandoned handles
+
+`Options::timeouts` sets total transaction, idle transaction, read snapshot,
+operation and commit-admission durations. Both local and shared transaction
+options can request shorter total/idle limits. Zero/overflow durations fail;
+durations use monotonic clocks and admission never restarts the total deadline.
+
+A weak-reference expiry registry sweeps abandoned handles. Expiry clears the
+private transaction state and its reservations/pins even while the caller keeps
+the handle. Read snapshots retain their catalog/sequence metadata after expiry,
+but reject data access. In-progress reads retain a registered file pin until they
+finish, so expiry never deletes files underneath I/O. Scans check deadlines
+between callbacks; the engine cannot preempt caller code or blocking OS I/O.
+
+An expired handle returns `TransactionExpired`; an operation/admission deadline
+returns `DeadlineExceeded`. Commit takes ownership of the staged data, checks its
+deadline while waiting for coordination and immediately before the WAL boundary.
+After writing begins it finishes synchronization/publication or returns an I/O
+outcome error, even if the deadline passes. A timeout never pretends to undo WAL
+bytes already written. The bounded commit queue stage replaces the temporary
+timed coordinator acquisition mechanism.

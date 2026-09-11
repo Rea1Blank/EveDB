@@ -17,6 +17,10 @@ pub enum Error {
     AlreadyExists(String),
     /// Another database handle owns the data directory.
     Locked,
+    /// The operation exceeded its deadline before commit crossed the WAL boundary.
+    DeadlineExceeded,
+    /// A transaction or read snapshot expired and released its retained resources.
+    TransactionExpired,
     /// An admission limit was reached before the requested write was accepted.
     LimitExceeded {
         /// The bounded resource.
@@ -57,6 +61,8 @@ impl fmt::Display for Error {
             Self::NotFound(s) => write!(f, "not found: {s}"),
             Self::AlreadyExists(s) => write!(f, "already exists: {s}"),
             Self::Locked => f.write_str("the data directory is already open"),
+            Self::DeadlineExceeded => f.write_str("operation deadline exceeded"),
+            Self::TransactionExpired => f.write_str("transaction or snapshot expired"),
             Self::LimitExceeded { resource, limit } => {
                 write!(f, "limit exceeded: {resource} (maximum {limit})")
             }
