@@ -13,7 +13,8 @@ entity lifecycle, transactions, and history retention.
 
 **Implementation status:** experimental local Rust storage engine with typed
 tables, atomic cross-table transactions, indexed current/history reads, replay,
-snapshots, retention, and WAL/checkpoint recovery. The server and network API
+snapshots, retention, incremental checkpoints that collect the generations they
+outgrow, and WAL/checkpoint recovery. The server and network API
 remain future work. Disk formats are not stable or production-qualified. See the
 [storage design and limits](docs/storage.md).
 
@@ -29,6 +30,7 @@ cargo run --locked -p evedb-cli -- --version
 cargo run --locked -p evedb-core --example lifecycle -- .local/lifecycle
 cargo run --locked -p evedb-cli -- inspect .local/lifecycle
 cargo run --locked -p evedb-cli -- checkpoint .local/lifecycle
+cargo run --locked -p evedb-cli -- compact .local/lifecycle
 ```
 
 `rust-toolchain.toml` pins the development toolchain, including rustfmt and Clippy.

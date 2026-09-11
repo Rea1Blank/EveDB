@@ -7,12 +7,12 @@ use crate::{
     model::*,
     snapshot::{self, Root, TableWriter},
     storage::{
-        frame, index,
-        pager::{self, Pager},
+        frame, heap, index,
+        pager::{self, FileId, Pager},
     },
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -35,6 +35,18 @@ pub struct Options {
     pub cache_bytes: usize,
     /// Number of checkpoint files kept open for reading.
     pub max_open_files: usize,
+    /// Rewrite a kept generation once this share of its entities is superseded.
+    ///
+    /// A checkpoint leaves unchanged entities in the files that already hold
+    /// them. Superseding one makes its former copy unreachable, so a generation
+    /// loses density over time; collecting it copies only what is still live.
+    pub compact_live_ratio: f64,
+    /// Number of generations one manifest may reference, including the new one.
+    ///
+    /// Reaching the limit forces the cheapest generations into the checkpoint
+    /// that publishes next, which bounds open files, startup verification, and
+    /// manifest size.
+    pub max_generations: usize,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -46,8 +58,21 @@ impl Default for Options {
             compress_history: true,
             cache_bytes: pager::DEFAULT_CACHE_BYTES,
             max_open_files: pager::DEFAULT_OPEN_FILES,
+            compact_live_ratio: 0.5,
+            max_generations: 8,
         }
     }
+}
+
+/// How many entities one published generation holds and how many are superseded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenerationStats {
+    /// The generation number, which also names its files on disk.
+    pub generation: u64,
+    /// Entities written into this generation.
+    pub entities: u64,
+    /// Entities of this generation that a later checkpoint has superseded.
+    pub dead: u64,
 }
 
 /// A single-owner local database that synchronizes the WAL before acknowledging writes.
@@ -88,6 +113,17 @@ impl Database {
                 "checkpoint and segment targets must be at least 4096 bytes".into(),
             ));
         }
+        if !(0.0..=1.0).contains(&options.compact_live_ratio) {
+            return Err(Error::Invalid(
+                "the compaction ratio must lie between 0.0 and 1.0".into(),
+            ));
+        }
+        if !(2..=heap::MAX_SLOTS).contains(&options.max_generations) {
+            return Err(Error::Invalid(format!(
+                "a manifest references between 2 and {} generations",
+                heap::MAX_SLOTS
+            )));
+        }
         let directory = path.as_ref().to_owned();
         fs::create_dir_all(&directory)?;
         let lock = OpenOptions::new()
@@ -100,7 +136,7 @@ impl Database {
         if !directory.join("control").exists() {
             initialize(&directory)?;
         }
-        if fs::read(directory.join("control"))? != b"EVEDB001" {
+        if fs::read(directory.join("control"))? != b"EVEDB002" {
             return Err(corrupt("unsupported database control format"));
         }
         let segments = numbered_files(&directory.join("wal"), "wal")?;
@@ -418,11 +454,79 @@ impl Database {
         Ok(())
     }
 
-    /// Rewrites live data into a new immutable generation and publishes it durably.
+    /// Publishes every live entity into one new generation, releasing all others.
     ///
-    /// Keeps the preceding checkpoint and its WAL for recovery. Only older,
-    /// engine-owned numeric generations are reclaimed. Checkpointing is synchronous.
+    /// This is the collector's full pass: it reclaims every superseded record at
+    /// the cost of rewriting the database. Use it when space matters more than
+    /// the pause; an ordinary [`checkpoint`](Self::checkpoint) collects only the
+    /// generations its policy selects.
+    pub fn compact(&mut self) -> Result<()> {
+        let all = self
+            .root
+            .generations
+            .iter()
+            .map(|entry| entry.generation)
+            .collect();
+        self.publish(all)
+    }
+    /// Reports the occupancy of each referenced generation, newest last.
+    ///
+    /// The counts are maintained at publication, so reading them costs no I/O.
+    pub fn generations(&self) -> Vec<GenerationStats> {
+        self.root
+            .generations
+            .iter()
+            .enumerate()
+            .map(|(slot, entry)| {
+                let total = self.root.totals(slot as u8);
+                GenerationStats {
+                    generation: entry.generation,
+                    entities: total.entities,
+                    dead: total.dead,
+                }
+            })
+            .collect()
+    }
+    /// Writes changed entities into a new generation and publishes it durably.
+    ///
+    /// Entities that no transaction touched stay in the files that already hold
+    /// them; only their primary-index entries are rewritten. Generations chosen
+    /// by the compaction policy are collected in the same pass. The preceding
+    /// checkpoint and its WAL are kept for recovery, and checkpointing is
+    /// synchronous.
     pub fn checkpoint(&mut self) -> Result<()> {
+        let absorb = self.collectable();
+        self.publish(absorb)
+    }
+    /// Chooses the generations whose live entities this checkpoint will rewrite.
+    ///
+    /// A generation is collected once it loses density, holds nothing live, or
+    /// has to make room within the manifest's generation budget. Choosing the
+    /// emptiest generation for the budget reclaims a slot for the least copying.
+    fn collectable(&self) -> BTreeSet<u64> {
+        let mut absorb = BTreeSet::new();
+        let mut kept = Vec::new();
+        for (slot, entry) in self.root.generations.iter().enumerate() {
+            let total = self.root.totals(slot as u8);
+            if total.live_ratio() < self.options.compact_live_ratio || total.entities == total.dead
+            {
+                absorb.insert(entry.generation);
+            } else {
+                kept.push((total.entities - total.dead, entry.generation));
+            }
+        }
+        kept.sort_unstable();
+        let mut over = (kept.len() + 1).saturating_sub(self.options.max_generations);
+        for &(_, generation) in &kept {
+            if over == 0 {
+                break;
+            }
+            absorb.insert(generation);
+            over -= 1;
+        }
+        absorb
+    }
+    fn publish(&mut self, absorb: BTreeSet<u64>) -> Result<()> {
         self.ready()?;
         let generation = self.next_generation;
         self.next_generation = generation
@@ -433,28 +537,51 @@ impl Database {
             .join("catalog")
             .join(format!("{generation:020}.catalog"));
         let mut catalog_file = File::create_new(catalog_path)?;
+        let (generations, slots) = self.root.rebuild_slots(&absorb, generation, self.lsn)?;
+        let new_slot = (generations.len() - 1) as u8;
         let mut root = Root {
             generation,
             lsn: self.lsn,
             catalog: self.catalog.clone(),
-            files: Vec::new(),
+            generations,
+            files: self.root.kept_files(&absorb),
+            occupancy: self.root.kept_occupancy(&slots),
         };
         for &table in self.catalog.keys() {
             let mut writer = TableWriter::create(
                 &self.directory,
                 table,
                 generation,
+                new_slot,
                 self.lsn,
                 self.options.history_segment_bytes,
                 self.options.compress_history,
             )?;
-            self.visit_entries(table, |id, _| {
+            let occupancy = &mut root.occupancy;
+            self.visit_entries(table, |id, locator| {
+                // An untouched entity whose generation survives keeps its records
+                // and only moves its primary-index entry into the new tree.
+                if let Some(value) = locator.filter(|_| !self.overlay.contains_key(&(table, id))) {
+                    if let Some(slot) = slots[usize::from(snapshot::entity_slot(value)?)] {
+                        return writer.carry(id, snapshot::remap(value, slot));
+                    }
+                } else if let Some(value) = locator
+                    && let Some(slot) = slots[usize::from(snapshot::entity_slot(value)?)]
+                {
+                    // A rewritten entity leaves an unreachable copy behind.
+                    occupancy.entry((table, slot)).or_default().dead += 1;
+                }
                 let data = self
                     .load(table, id)?
                     .ok_or_else(|| corrupt("entity vanished during checkpoint"))?;
                 writer.append(id, &data)
             })?;
-            root.files.extend(writer.finish()?);
+            let (files, entities) = writer.finish()?;
+            root.files.extend(files);
+            root.occupancy
+                .entry((table, new_slot))
+                .or_default()
+                .entities += entities;
             fault("checkpoint-files");
         }
         let payload = root.encode();
@@ -481,29 +608,35 @@ impl Database {
         wal.sync_all()?;
         snapshot::sync_directory(&self.directory.join("wal"))?;
         fault("checkpoint-published");
-        let previous = self.root.generation;
-        self.root = root;
+        let previous = std::mem::replace(&mut self.root, root);
         self.wal = wal;
         self.overlay.clear();
         self.poisoned = false;
         // Publication succeeded: cleanup errors do not invalidate acknowledged commits.
-        self.pager
-            .forget(|file| file.generation != previous && file.generation != generation);
-        self.cleanup(previous, generation)?;
+        let keep: BTreeSet<_> = previous.file_ids().chain(self.root.file_ids()).collect();
+        // Closing a descriptor before deleting its file also satisfies Windows.
+        self.pager.forget(|file| !keep.contains(&file));
+        self.cleanup(previous.generation, &keep)?;
         fault("checkpoint-cleanup");
         Ok(())
     }
-    fn cleanup(&self, previous: u64, current: u64) -> Result<()> {
+    /// Deletes every file that neither the new nor the retained manifest names.
+    ///
+    /// Generations are shared, so age no longer decides what a checkpoint may
+    /// reclaim. A file survives while a manifest still references it, and the
+    /// preceding manifest is kept as the recovery baseline.
+    fn cleanup(&self, previous: u64, keep: &BTreeSet<FileId>) -> Result<()> {
         for (number, path) in numbered_files(&self.directory.join("wal"), "wal")? {
             if number < previous {
                 fs::remove_file(path)?;
             }
         }
         for (number, path) in numbered_files(&self.directory.join("catalog"), "catalog")? {
-            if number != previous && number != current {
+            if number != previous && number != self.root.generation {
                 fs::remove_file(path)?;
             }
         }
+        let keep: BTreeSet<_> = keep.iter().map(|file| file.path(&self.directory)).collect();
         for table in fs::read_dir(self.directory.join("tables"))? {
             let table = table?;
             if !table.file_type()?.is_dir()
@@ -513,13 +646,12 @@ impl Database {
             }
             for entry in fs::read_dir(table.path())? {
                 let entry = entry?;
-                if !entry.file_type()?.is_dir() {
+                if !entry.file_type()?.is_dir()
+                    || parse_number(&entry.file_name().to_string_lossy()).is_none()
+                {
                     continue;
                 }
-                if let Some(number) = parse_number(&entry.file_name().to_string_lossy())
-                    && number != previous
-                    && number != current
-                {
+                if !prune(&entry.path(), &keep)? {
                     fs::remove_dir_all(entry.path())?;
                 }
             }
@@ -945,7 +1077,7 @@ fn initialize(directory: &Path) -> Result<()> {
     frame::append(&mut wal, 1, 0, &payload)?;
     wal.sync_all()?;
     let mut control = File::create_new(directory.join("control"))?;
-    control.write_all(b"EVEDB001")?;
+    control.write_all(b"EVEDB002")?;
     control.sync_all()?;
     snapshot::sync_directory(&directory.join("catalog"))?;
     snapshot::sync_directory(&directory.join("wal"))?;
@@ -954,6 +1086,28 @@ fn initialize(directory: &Path) -> Result<()> {
         snapshot::sync_directory(parent)?;
     }
     Ok(())
+}
+/// Removes unreferenced files from one generation directory.
+///
+/// Returns whether the directory still holds a file a manifest references.
+fn prune(directory: &Path, keep: &BTreeSet<PathBuf>) -> Result<bool> {
+    let mut used = false;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            if prune(&path, keep)? {
+                used = true;
+            } else {
+                fs::remove_dir_all(&path)?;
+            }
+        } else if keep.contains(&path) {
+            used = true;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(used)
 }
 fn parse_number(value: &str) -> Option<u64> {
     (value.len() == 20 && value.bytes().all(|b| b.is_ascii_digit()))

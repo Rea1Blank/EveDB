@@ -9,8 +9,8 @@ workspace root. Cargo.lock is committed. Packages are not published to crates.io
 The dependency direction is `evedb-cli -> evedb-core`. The core crate
 must not depend on CLI code. Both crates use only the Rust standard library.
 
-The executable provides initialization, catalog inspection, and checkpoint
-commands. It uses the same public database API as Rust applications and the
+The executable provides initialization, catalog inspection, checkpoint, and
+compaction commands. It uses the same public database API as Rust applications and the
 lifecycle example. Inspection opens the database with its exclusive lock and
 normal recovery; it is not an offline forensic reader.
 
@@ -22,7 +22,7 @@ The core modules have the following responsibilities:
 | --- | --- |
 | `model` | Typed schemas, entities, events, version reconstruction, retention |
 | `database` | Public API, transaction staging, WAL recovery, checkpoint publication |
-| `snapshot` | Generation manifests, table readers/writers, indexed historical reads, compression |
+| `snapshot` | Generation manifests, slot addressing, occupancy counts, table readers/writers, indexed historical reads, compression |
 | `storage/page` | Checked 8 KiB slotted-page format |
 | `storage/pager` | Bounded cache of decoded pages and open checkpoint files |
 | `storage/heap` | Packed records and overflow chains |
@@ -34,9 +34,13 @@ One database handle owns the directory. Transactions exclusively borrow it,
 stage changes, synchronize one complete WAL frame, then publish all changes
 together. Current reads combine the recent in-memory overlay with immutable
 checkpoint files. Historical reads seek through snapshot and event indexes;
-explicit replay always starts at the retained base. Checkpoints rewrite live
-data into a new generation and retain a recovery baseline before reclaiming
-old files. There are no in-place tree updates, MVCC, or asynchronous workers.
+explicit replay always starts at the retained base. A checkpoint writes only the
+entities a transaction touched, leaves the rest in the generations that already
+hold them, and publishes a manifest addressing every referenced generation. It
+also collects generations that have lost density or exceed the generation budget,
+rewriting their live entities. A recovery baseline is retained, and files no
+manifest references are deleted. There are no in-place tree updates, MVCC, or
+asynchronous workers: collection runs on the writing thread.
 
 The [storage design](storage.md) explains the borrowed database techniques,
 actual file layout, synchronization protocol, and experimental limits. The

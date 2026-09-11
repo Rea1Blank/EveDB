@@ -11,12 +11,13 @@ fn main() -> ExitCode {
         println!(
             "EveDB {}\n\n\
              Experimental local entity storage engine.\n\n\
-             Usage: evedb <init | inspect | checkpoint> <directory>\n\
+             Usage: evedb <init | inspect | checkpoint | compact> <directory>\n\
                     evedb [--help | --version]\n\n\
              Commands:\n\
                init          Initialize or open a database directory\n\
                inspect       Open an existing database and show its catalog\n\
-               checkpoint    Save an existing database into a new generation\n\n\
+               checkpoint    Save changed entities into a new generation\n\
+               compact       Rewrite every live entity and release the rest\n\n\
              Options:\n\
                -h, --help     Show this help\n\
                -V, --version  Show the version",
@@ -27,7 +28,9 @@ fn main() -> ExitCode {
         println!("evedb {}", evedb_core::VERSION);
         ExitCode::SUCCESS
     } else if args.len() == 2
-        && (args[0] == "init" || args[0] == "inspect" || args[0] == "checkpoint")
+        && ["init", "inspect", "checkpoint", "compact"]
+            .iter()
+            .any(|command| args[0] == *command)
     {
         match run(args[0].to_str().unwrap(), Path::new(&args[1])) {
             Ok(()) => ExitCode::SUCCESS,
@@ -65,10 +68,24 @@ fn run(command: &str, directory: &Path) -> Result<()> {
                     table.schema().fields.len()
                 );
             }
+            println!("Generations: {}", db.generations().len());
+            for entry in db.generations() {
+                println!(
+                    "  {}: {} entities, {} superseded",
+                    entry.generation, entry.entities, entry.dead
+                );
+            }
         }
         "checkpoint" => {
             db.checkpoint()?;
             println!("Checkpoint saved at transaction {}", db.sequence());
+        }
+        "compact" => {
+            db.compact()?;
+            println!(
+                "Compacted into generation {}",
+                db.generations()[0].generation
+            );
         }
         _ => unreachable!("validated command"),
     }

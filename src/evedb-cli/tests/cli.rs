@@ -21,7 +21,7 @@ fn help_and_no_arguments_describe_the_engine() {
 }
 
 #[test]
-fn database_commands_initialize_inspect_and_checkpoint() {
+fn database_commands_initialize_inspect_checkpoint_and_compact() {
     let path = std::env::temp_dir().join(format!("evedb-cli-{}", std::process::id()));
     assert!(!path.exists(), "test directory must be unused");
     let run = |command| {
@@ -52,7 +52,9 @@ fn database_commands_initialize_inspect_and_checkpoint() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Transaction sequence: 1"));
     assert!(stdout.contains("1: items (schema 1, 1 fields)"));
+    assert!(stdout.contains("Generations: 1"));
     assert!(run("checkpoint").status.success());
+    assert!(run("compact").status.success());
     assert!(run("init").status.success());
     assert!(run("inspect").status.success());
     let canonical = path.canonicalize().unwrap();

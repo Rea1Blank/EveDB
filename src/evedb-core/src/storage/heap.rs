@@ -7,6 +7,20 @@ use super::{
 use crate::{Error, Result, codec::MAX_RECORD, error::corrupt};
 use std::{fs::File, io::Write, path::Path, sync::Arc};
 
+/// The number of generation slots one manifest can address.
+pub(crate) const MAX_SLOTS: usize = 256;
+/// Pages addressable by one heap file, leaving the top byte to the slot.
+const PAGE_LIMIT: u64 = 1 << 40;
+
+/// Stamps the generation slot of a manifest onto an in-file location.
+pub(crate) fn locate(slot: u8, location: u64) -> u64 {
+    (u64::from(slot) << 56) | location
+}
+/// Splits a stored locator into its generation slot and in-file location.
+pub(crate) fn split(locator: u64) -> (u8, u64) {
+    ((locator >> 56) as u8, locator & ((PAGE_LIMIT << 16) - 1))
+}
+
 pub(crate) struct HeapWriter {
     file: File,
     page: SlottedPage,
@@ -34,6 +48,11 @@ impl HeapWriter {
     pub fn append(&mut self, bytes: &[u8]) -> Result<u64> {
         if bytes.len() > MAX_RECORD {
             return Err(Error::Invalid("record exceeds 16 MiB".into()));
+        }
+        if self.page.page_id() >= PAGE_LIMIT {
+            return Err(Error::Invalid(
+                "heap file exceeds its addressable size".into(),
+            ));
         }
         if bytes.len() < MAX_RECORD_SIZE {
             let mut record = Vec::with_capacity(bytes.len() + 1);
