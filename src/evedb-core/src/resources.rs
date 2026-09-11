@@ -21,6 +21,10 @@ pub struct Limits {
     pub max_transaction_bytes: usize,
     /// Accepted mutation bytes still staged, queued, or retained in published views.
     pub max_resident_write_bytes: usize,
+    /// Waiting and currently syncing commit requests.
+    pub max_queued_commits: usize,
+    /// Encoded mutation bytes in waiting and currently syncing commit requests.
+    pub max_queued_commit_bytes: usize,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -31,12 +35,16 @@ impl Default for Limits {
             max_transaction_operations: 100_000,
             max_transaction_bytes: MAX_FRAME,
             max_resident_write_bytes: 512 * 1024 * 1024,
+            max_queued_commits: 256,
+            max_queued_commit_bytes: 128 * 1024 * 1024,
         }
     }
 }
 impl Limits {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.max_transactions == 0
+            || self.max_queued_commits == 0
+            || self.max_queued_commit_bytes < self.max_transaction_bytes
             || self.max_snapshots == 0
             || self.max_transaction_operations == 0
             || self.max_transaction_bytes < 8

@@ -276,6 +276,13 @@ pub struct Reader {
     pub(crate) shared: Arc<ReaderShared>,
 }
 impl Reader {
+    pub(crate) fn ready(&self) -> Result<()> {
+        self.shared
+            .current
+            .read()
+            .map_err(|_| Error::NeedsRecovery)?
+            .ready()
+    }
     /// Returns current admission counters without acquiring a snapshot pin.
     pub fn resource_usage(&self) -> crate::ResourceUsage {
         self.shared

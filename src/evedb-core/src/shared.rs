@@ -2,9 +2,15 @@
 
 //! Concurrent connections and the ordered commit coordinator.
 
+#[cfg(test)]
+#[path = "shared_tests.rs"]
+mod group_tests;
+
 use crate::{
     Database, Entity, Error, Fields, Options, ReadSnapshot, Reader, Result, Schema, SnapshotStats,
-    TableId, Transaction, database::Prepared,
+    TableId, Transaction,
+    commit_queue::{Queue, Ticket},
+    database::Prepared,
 };
 use std::{
     collections::BTreeMap,
@@ -94,11 +100,12 @@ struct Coordinator {
 ///
 /// Readers and staging do not acquire the commit mutex. Only validation, WAL
 /// synchronization, publication, and synchronous maintenance use it. Network
-/// transport, group commit, bounded admission, and background maintenance remain
+/// transport and background maintenance remain
 /// separate roadmap work. Use one owner per directory and clone its connections.
 #[derive(Clone)]
 pub struct SharedDatabase {
     coordinator: Arc<Mutex<Coordinator>>,
+    queue: Arc<Queue>,
     reader: Reader,
     options: Arc<Options>,
 }
@@ -113,6 +120,7 @@ impl SharedDatabase {
     }
     pub(crate) fn from_database(database: Database) -> Self {
         Self {
+            queue: Arc::new(Queue::default()),
             reader: database.reader(),
             options: Arc::new(database.options()),
             coordinator: Arc::new(Mutex::new(Coordinator {
@@ -212,49 +220,168 @@ impl SharedDatabase {
             .retain(|_, sequence| *sequence > oldest);
     }
     pub(crate) fn commit(&self, batch: Prepared) -> Result<u64> {
+        self.reader.ready()?;
+        if batch.is_empty() {
+            return Ok(batch.base_sequence);
+        }
+        let end = batch.deadline;
+        crate::deadline::check(end)?;
+        let ticket = self.queue.submit(batch, &self.options.limits)?;
+        loop {
+            let mut state = self.queue.state.lock().map_err(|_| Error::NeedsRecovery)?;
+            if let Some(result) = ticket.lock().expect("commit request").result.take() {
+                return result;
+            }
+            if Queue::expired(end) && Queue::cancel(&mut state, &ticket) {
+                self.queue.changed.notify_all();
+                continue;
+            }
+            if !state.running {
+                state.running = true;
+                drop(state);
+                self.run_group(end);
+            } else {
+                let wait = end.map_or(std::time::Duration::from_millis(10), |end| {
+                    end.saturating_duration_since(std::time::Instant::now())
+                        .min(std::time::Duration::from_millis(10))
+                });
+                let wait = wait.max(std::time::Duration::from_millis(1));
+                drop(
+                    self.queue
+                        .changed
+                        .wait_timeout(state, wait)
+                        .map_err(|_| Error::NeedsRecovery)?,
+                );
+            }
+        }
+    }
+    fn run_group(&self, end: Option<std::time::Instant>) {
+        let mut leadership = Leadership {
+            queue: &self.queue,
+            tickets: Vec::new(),
+            armed: true,
+        };
         let mut coordinator = loop {
-            crate::deadline::check(batch.deadline)?;
+            if Queue::expired(end) {
+                return;
+            }
             match self.coordinator.try_lock() {
                 Ok(guard) => break guard,
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::NeedsRecovery),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    let mut state = self.queue.state.lock().expect("commit queue");
+                    let claimed = Queue::claim(&mut state, &self.options.group_commit);
+                    leadership
+                        .tickets
+                        .extend(claimed.into_iter().map(|(ticket, _)| ticket));
+                    return;
+                }
                 Err(std::sync::TryLockError::WouldBlock) => {
                     std::thread::sleep(std::time::Duration::from_millis(1))
                 }
             }
         };
-        coordinator.database.ready()?;
-        if batch.is_empty() {
-            return Ok(batch.base_sequence);
+        let gather_end = std::time::Instant::now() + self.options.group_commit.delay;
+        let gather_end = end.map_or(gather_end, |end| end.min(gather_end));
+        let mut state = self.queue.state.lock().expect("commit queue");
+        while state.waiting.len() < self.options.group_commit.max_transactions
+            && std::time::Instant::now() < gather_end
+        {
+            state = self
+                .queue
+                .changed
+                .wait_timeout(
+                    state,
+                    gather_end.saturating_duration_since(std::time::Instant::now()),
+                )
+                .expect("commit queue")
+                .0;
         }
-        if coordinator.catalog_revision > batch.base_sequence {
-            return Err(Error::Conflict {
-                table: None,
-                entity: None,
-            });
-        }
-        let keys: Vec<_> = batch.keys().collect();
-        for key in &keys {
-            if coordinator
-                .revisions
-                .get(key)
-                .is_some_and(|lsn| *lsn > batch.base_sequence)
-            {
-                return Err(Error::Conflict {
-                    table: Some(key.0),
-                    entity: Some(key.1),
-                });
+        let claimed = Queue::claim(&mut state, &self.options.group_commit);
+        drop(state);
+        leadership
+            .tickets
+            .extend(claimed.iter().map(|(ticket, _)| ticket.clone()));
+        let mut accepted = Vec::new();
+        let mut metadata = Vec::new();
+        let mut completed = Vec::new();
+        let mut group_keys = BTreeMap::new();
+        let mut catalog_revision = coordinator.catalog_revision;
+        for (ticket, batch) in claimed {
+            let validation = (|| -> Result<()> {
+                coordinator.database.ready()?;
+                crate::deadline::check(batch.deadline)?;
+                if catalog_revision > batch.base_sequence {
+                    return Err(Error::Conflict {
+                        table: None,
+                        entity: None,
+                    });
+                }
+                for key in batch.keys() {
+                    if group_keys
+                        .get(&key)
+                        .or_else(|| coordinator.revisions.get(&key))
+                        .is_some_and(|lsn| *lsn > batch.base_sequence)
+                    {
+                        return Err(Error::Conflict {
+                            table: Some(key.0),
+                            entity: Some(key.1),
+                        });
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = validation {
+                completed.push((ticket, Err(error)));
+                continue;
             }
+            let keys: Vec<_> = batch.keys().collect();
+            let changes_catalog = batch.changes_catalog();
+            // Only comparison with the begin sequence matters during validation.
+            // Actual revision sequences are installed after durable publication.
+            for key in &keys {
+                group_keys.insert(*key, u64::MAX);
+            }
+            if changes_catalog {
+                catalog_revision = u64::MAX;
+            }
+            metadata.push((ticket, keys, changes_catalog));
+            accepted.push(batch);
         }
-        let changes_catalog = batch.changes_catalog();
-        let sequence = batch.commit(&mut coordinator.database)?;
-        // The mutex covers both publication and dependency bookkeeping: another
-        // commit can never validate against a view whose revisions are missing.
-        for key in keys {
-            coordinator.revisions.insert(key, sequence);
+        let results = Prepared::commit_group(accepted, &mut coordinator.database);
+        for ((ticket, keys, catalog), result) in metadata.into_iter().zip(results) {
+            if let Ok(sequence) = &result {
+                for key in keys {
+                    coordinator.revisions.insert(key, *sequence);
+                }
+                if catalog {
+                    coordinator.catalog_revision = *sequence;
+                }
+            }
+            completed.push((ticket, result));
         }
-        if changes_catalog {
-            coordinator.catalog_revision = sequence;
+        drop(coordinator);
+        leadership.tickets.clear();
+        leadership.armed = false;
+        self.queue.finish(completed);
+    }
+}
+// Hand leadership back even when coordination fails or unwinds. Claimed callers
+// must never wait forever after a panic in the writer.
+struct Leadership<'a> {
+    queue: &'a Queue,
+    tickets: Vec<Ticket>,
+    armed: bool,
+}
+impl Drop for Leadership<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
         }
-        Ok(sequence)
+        self.queue.finish(
+            self.tickets
+                .drain(..)
+                .map(|ticket| (ticket, Err(Error::NeedsRecovery)))
+                .collect(),
+        );
     }
 }

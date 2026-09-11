@@ -10,6 +10,7 @@ pub mod storage;
 
 mod checksum;
 mod codec;
+mod commit_queue;
 mod database;
 mod deadline;
 mod error;
@@ -22,6 +23,7 @@ mod snapshot;
 #[cfg(test)]
 mod test_support;
 
+pub use commit_queue::GroupCommit;
 pub use database::{Database, Options, Transaction};
 pub use deadline::Timeouts;
 pub use reader::{ReadSnapshot, Reader, SnapshotStats};

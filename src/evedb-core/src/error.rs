@@ -102,6 +102,41 @@ impl std::error::Error for Error {
     }
 }
 
+impl Error {
+    pub(crate) fn duplicate(&self) -> Self {
+        match self {
+            Self::Io(e) => Self::Io(io::Error::new(e.kind(), e.to_string())),
+            Self::CommitUnknown(e) => Self::CommitUnknown(io::Error::new(e.kind(), e.to_string())),
+            Self::Corrupt(s) => Self::Corrupt(s.clone()),
+            Self::Invalid(s) => Self::Invalid(s.clone()),
+            Self::NotFound(s) => Self::NotFound(s.clone()),
+            Self::AlreadyExists(s) => Self::AlreadyExists(s.clone()),
+            Self::Locked => Self::Locked,
+            Self::DeadlineExceeded => Self::DeadlineExceeded,
+            Self::TransactionExpired => Self::TransactionExpired,
+            Self::LimitExceeded { resource, limit } => Self::LimitExceeded {
+                resource,
+                limit: *limit,
+            },
+            Self::UnsupportedIsolation(level) => Self::UnsupportedIsolation(*level),
+            Self::Conflict { table, entity } => Self::Conflict {
+                table: *table,
+                entity: *entity,
+            },
+            Self::VersionUnavailable {
+                requested,
+                first,
+                last,
+            } => Self::VersionUnavailable {
+                requested: *requested,
+                first: *first,
+                last: *last,
+            },
+            Self::NeedsRecovery => Self::NeedsRecovery,
+        }
+    }
+}
+
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
         Self::Io(value)

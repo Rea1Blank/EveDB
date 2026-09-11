@@ -76,3 +76,31 @@ Transactions share the catalog until a schema operation changes it. Ordinary
 data transactions no longer clone every table definition at begin/commit. The
 checkpoint format is unchanged; persistent here means immutable shared memory
 versions, not an additional on-disk tree format.
+
+## Bounded group commit
+
+Shared connections use a FIFO queue bounded by request count and encoded mutation
+bytes, including the group currently syncing. Full admission fails explicitly;
+waiting requests can expire and immediately release their staging/pin reservations.
+A caller leads one bounded group and hands coordination to another waiting caller.
+There is no permanently running writer thread retaining an abandoned database.
+
+`Options::group_commit` bounds transaction count and mutation bytes per flush.
+One transaction larger than the group byte target runs alone. The default adds no
+intentional collection delay; an optional delay is capped at one second. Local
+exclusive transactions still flush individually. Each accepted transaction keeps
+its own WAL frame and contiguous commit sequence; one synchronization covers the
+group, followed by coherent publication. Validation includes overlapping writes
+and catalog changes inside the group. Conflicts abort only the losing transaction.
+
+Deadline checks apply before writing. A request claimed by the writer finishes its
+cooperative deadline checks after any blocking checkpoint I/O. Once WAL writing
+starts, all accepted members wait for synchronization/publication or receive
+`CommitUnknown` on I/O failure. All existing views are then poisoned until reopen.
+An unsynchronized group is not promised all-or-nothing recovery: complete frames
+may recover independently, while partial frames never publish partial transactions.
+
+Tests count actual WAL synchronizations internally, verify queue count/byte limits,
+expiry and leadership handoff, check conflicting group members, and kill subprocesses
+or inject I/O failures around group writes and synchronization. The internal test
+counter is not a production metrics system.
