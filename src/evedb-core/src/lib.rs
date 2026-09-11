@@ -11,6 +11,7 @@ pub mod storage;
 mod checksum;
 mod codec;
 mod database;
+mod deadline;
 mod error;
 mod model;
 mod reader;
@@ -21,6 +22,7 @@ mod snapshot;
 mod test_support;
 
 pub use database::{Database, Options, Transaction};
+pub use deadline::Timeouts;
 pub use reader::{ReadSnapshot, Reader, SnapshotStats};
 pub use resources::{Limits, ResourceUsage};
 pub use shared::{IsolationLevel, SharedDatabase, TransactionOptions};

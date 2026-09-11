@@ -64,13 +64,18 @@ pub struct ResourceUsage {
 pub(crate) struct Resources {
     pub limits: Limits,
     usage: Mutex<ResourceUsage>,
+    pub timeouts: crate::Timeouts,
+    pub reaper: Arc<crate::deadline::Reaper>,
 }
 impl Resources {
-    pub fn new(limits: Limits) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(limits: Limits, timeouts: crate::Timeouts) -> Result<Arc<Self>> {
+        let reaper = crate::deadline::Reaper::new(timeouts.reap_interval)?;
+        Ok(Arc::new(Self {
+            reaper,
+            timeouts,
             limits,
             usage: Mutex::new(ResourceUsage::default()),
-        })
+        }))
     }
     pub fn usage(&self) -> ResourceUsage {
         *self.usage.lock().expect("resource accounting")
