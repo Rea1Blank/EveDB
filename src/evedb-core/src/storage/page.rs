@@ -134,9 +134,7 @@ impl SlottedPage {
             return Err(PageError::InvalidLayout);
         }
         let expected_crc = u32::from_le_bytes(page.bytes[32..36].try_into().unwrap());
-        let mut checked = page.clone();
-        checked.refresh_checksum();
-        if expected_crc != u32::from_le_bytes(checked.bytes[32..36].try_into().unwrap()) {
+        if expected_crc != page.computed_checksum() {
             return Err(PageError::ChecksumMismatch);
         }
         Ok(page)
@@ -269,9 +267,20 @@ impl SlottedPage {
         Ok(())
     }
 
+    /// Computes the checksum the page should carry, treating its field as zero.
+    ///
+    /// The field is skipped in place rather than by copying the page, so
+    /// verifying a page costs no allocation and no 8 KiB memcpy.
+    fn computed_checksum(&self) -> u32 {
+        let mut crc = crate::checksum::Checksum::new();
+        crc.update(&self.bytes[..32]);
+        crc.update(&[0; 4]);
+        crc.update(&self.bytes[36..]);
+        crc.finish()
+    }
+
     fn refresh_checksum(&mut self) {
-        self.bytes[32..36].fill(0);
-        let crc = crate::checksum::crc32c(&self.bytes);
+        let crc = self.computed_checksum();
         self.bytes[32..36].copy_from_slice(&crc.to_le_bytes());
     }
 

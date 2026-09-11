@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use super::{MAX_RECORD_SIZE, PAGE_SIZE, SlottedPage};
-use crate::{Error, Result, codec::MAX_RECORD, error::corrupt};
-use std::{
-    fs::File,
-    io::{Read, Seek, SeekFrom, Write},
-    path::Path,
+use super::{
+    MAX_RECORD_SIZE, PAGE_SIZE, SlottedPage,
+    pager::{FileId, Pager},
 };
+use crate::{Error, Result, codec::MAX_RECORD, error::corrupt};
+use std::{fs::File, io::Write, path::Path, sync::Arc};
 
 pub(crate) struct HeapWriter {
     file: File,
@@ -67,10 +66,9 @@ impl HeapWriter {
     }
 }
 
-pub(crate) fn read(path: &Path, location: u64, lsn: u64) -> Result<Vec<u8>> {
-    let mut file = File::open(path)?;
+pub(crate) fn read(pager: &Pager, file: FileId, location: u64, lsn: u64) -> Result<Vec<u8>> {
     let page_id = location >> 16;
-    let page = read_page(&mut file, page_id, lsn)?;
+    let page = read_page(pager, file, page_id, lsn)?;
     let record = page
         .get(location as u16)
         .ok_or_else(|| corrupt("absent heap slot"))?;
@@ -85,16 +83,17 @@ pub(crate) fn read(path: &Path, location: u64, lsn: u64) -> Result<Vec<u8>> {
             {
                 return Err(corrupt("invalid overflow chain"));
             }
+            let header: [u8; 12] = record[1..13].try_into().unwrap();
             let mut bytes = Vec::with_capacity(total);
             for index in 0..count {
-                let chunk_page = read_page(&mut file, page_id + index as u64, lsn)?;
+                let chunk_page = read_page(pager, file, page_id + index as u64, lsn)?;
                 let chunk = chunk_page
                     .get(0)
                     .ok_or_else(|| corrupt("missing overflow record"))?;
                 if chunk.len() < 13
                     || chunk[0] != 1
-                    || chunk[1..5] != record[1..5]
-                    || chunk[9..13] != record[9..13]
+                    || chunk[1..5] != header[..4]
+                    || chunk[9..13] != header[8..]
                     || u32::from_le_bytes(chunk[5..9].try_into().unwrap()) as usize != index
                 {
                     return Err(corrupt("invalid overflow fragment"));
@@ -112,15 +111,15 @@ pub(crate) fn read(path: &Path, location: u64, lsn: u64) -> Result<Vec<u8>> {
         _ => Err(corrupt("unknown heap record kind")),
     }
 }
-fn read_page(file: &mut File, id: u64, lsn: u64) -> Result<SlottedPage> {
-    let offset = id
-        .checked_mul(PAGE_SIZE as u64)
-        .ok_or_else(|| corrupt("page offset overflow"))?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut bytes = [0; PAGE_SIZE];
-    file.read_exact(&mut bytes)?;
-    let page = SlottedPage::from_bytes(&bytes)?;
-    if page.page_id() != id || page.lsn() != lsn {
+fn read_page(pager: &Pager, file: FileId, id: u64, lsn: u64) -> Result<Arc<SlottedPage>> {
+    let page = pager.page(file, id, |bytes: &[u8; PAGE_SIZE]| {
+        let page = SlottedPage::from_bytes(bytes)?;
+        if page.page_id() != id {
+            return Err(corrupt("misdirected heap page"));
+        }
+        Ok(page)
+    })?;
+    if page.lsn() != lsn {
         return Err(corrupt("misdirected heap page"));
     }
     Ok(page)
@@ -129,12 +128,17 @@ fn read_page(file: &mut File, id: u64, lsn: u64) -> Result<SlottedPage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::{
+        storage::pager::{DEFAULT_CACHE_BYTES, DEFAULT_OPEN_FILES},
+        test_support::TempDir,
+    };
 
     #[test]
     fn inline_and_overflow_boundaries_roundtrip_with_identity_checks() {
         let dir = TempDir::new();
-        let path = dir.0.join("heap.pages");
+        let file = FileId::new(1, 1, 0, 0);
+        let path = file.path(&dir.0);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut writer = HeapWriter::create(&path, 19).unwrap();
         let mut records = Vec::new();
         for size in [
@@ -150,10 +154,11 @@ mod tests {
             records.push((location, bytes));
         }
         writer.finish().unwrap();
+        let pager = Pager::new(dir.0.clone(), DEFAULT_CACHE_BYTES, DEFAULT_OPEN_FILES);
         for (location, bytes) in records {
-            assert_eq!(read(&path, location, 19).unwrap(), bytes);
+            assert_eq!(read(&pager, file, location, 19).unwrap(), bytes);
         }
-        assert!(read(&path, 0, 20).is_err());
-        assert!(read(&path, u64::MAX, 19).is_err());
+        assert!(read(&pager, file, 0, 20).is_err());
+        assert!(read(&pager, file, u64::MAX, 19).is_err());
     }
 }

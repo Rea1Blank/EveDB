@@ -24,6 +24,7 @@ The core modules have the following responsibilities:
 | `database` | Public API, transaction staging, WAL recovery, checkpoint publication |
 | `snapshot` | Generation manifests, table readers/writers, indexed historical reads, compression |
 | `storage/page` | Checked 8 KiB slotted-page format |
+| `storage/pager` | Bounded cache of decoded pages and open checkpoint files |
 | `storage/heap` | Packed records and overflow chains |
 | `storage/index` | Immutable B+tree build, point lookup, predecessor lookup, range scan |
 | `storage/frame` | Bounded checksummed WAL/event/catalog frames |

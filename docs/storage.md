@@ -72,7 +72,10 @@ A generation is immutable after publication. Current rows use an 8 KiB slotted
 heap and a separate B+tree primary index. The tree is bulk-built bottom-up during
 a checkpoint; transactional writes first enter the WAL and an in-memory overlay.
 This version does not split or mutate tree pages in place. Linked leaves support
-ordered range scans. Heap locators combine a page ID and slot ID and are scoped
+ordered range scans. Branch separators carry the first key of their subtree, so a
+descent reaches the leaf that owns both a key and its predecessor; node search is
+binary. Ordered scans read each record through the index entry they already hold
+instead of descending the tree a second time. Heap locators combine a page ID and slot ID and are scoped
 to a generation; entity IDs remain independent of those locations.
 
 Each heap/index page carries a version, identity, checkpoint sequence number,
@@ -177,6 +180,8 @@ old shared segments can be deleted. This is not secure erasure of old bytes.
 | Automatic snapshot interval | Every 32 entity versions; zero disables it |
 | Automatic retention | Disabled (`None`); retain all events |
 | History compression | RLE with a raw fallback, enabled |
+| Page cache budget | 64 MiB of decoded checkpoint pages |
+| Open checkpoint files | 256 descriptors |
 | Fields per schema | 1..=4096; IDs nonzero and unique |
 | Table/field name length | 1..=255 UTF-8 bytes, without control characters |
 | Encoded field collection | At most 8 MiB |
@@ -191,11 +196,14 @@ initialization can leave a directory needing manual inspection before reuse.
 Use disposable data while these guarantees and formats mature.
 
 Checkpoints synchronously rewrite the whole database. Startup streams every
-checkpoint file to verify its checksum. Point reads fetch index/heap pages on
-demand, but there is no engine buffer pool or open-file cache. A changed entity's
-whole retained history is loaded into memory; transactions stage all touched
-entities, and recovery builds the overlay from the remaining WAL. The WAL size
-target is not a hard memory bound. Index construction retains one separator per
+checkpoint file to verify its checksum. A bounded cache holds decoded checkpoint
+pages and open descriptors; because a published page never changes, it is
+validated once when it enters the cache rather than on every read, and a
+reclaimed generation is dropped from the cache. The cache budget is a page count
+derived from `cache_bytes` and does not bound the rest of engine memory. A
+changed entity's whole retained history is loaded into memory; transactions
+stage all touched entities, and recovery builds the overlay from the remaining
+WAL. The WAL size target is not a hard memory bound. Index construction retains one separator per
 leaf before building parent levels, so its memory also grows with index size.
 `events` returns an allocated vector. Large histories and frequent checkpoints
 can therefore be expensive despite indexed historical reads.

@@ -8,5 +8,6 @@ pub(crate) mod frame;
 pub(crate) mod heap;
 pub(crate) mod index;
 mod page;
+pub(crate) mod pager;
 
 pub use page::{MAX_RECORD_SIZE, PAGE_SIZE, PageError, SlottedPage};

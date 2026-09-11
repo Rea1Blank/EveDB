@@ -6,7 +6,10 @@ use crate::{
     error::corrupt,
     model::*,
     snapshot::{self, Root, TableWriter},
-    storage::{frame, index},
+    storage::{
+        frame, index,
+        pager::{self, Pager},
+    },
 };
 use std::{
     collections::BTreeMap,
@@ -28,6 +31,10 @@ pub struct Options {
     pub retain_events: Option<usize>,
     /// Use RLE for history records only when it reduces their size.
     pub compress_history: bool,
+    /// Budget for the cache of decoded checkpoint pages.
+    pub cache_bytes: usize,
+    /// Number of checkpoint files kept open for reading.
+    pub max_open_files: usize,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -37,6 +44,8 @@ impl Default for Options {
             snapshot_interval: 32,
             retain_events: None,
             compress_history: true,
+            cache_bytes: pager::DEFAULT_CACHE_BYTES,
+            max_open_files: pager::DEFAULT_OPEN_FILES,
         }
     }
 }
@@ -51,6 +60,7 @@ impl Default for Options {
 /// directory synchronization is currently implemented only on Unix.
 pub struct Database {
     directory: PathBuf,
+    pager: Pager,
     _lock: File,
     wal: File,
     root: Root,
@@ -112,10 +122,15 @@ impl Database {
                 _ => return Err(corrupt("WAL segment lacks its checkpoint header")),
             }
         }
+        let pager = Pager::new(
+            directory.clone(),
+            options.cache_bytes,
+            options.max_open_files,
+        );
         let mut selected = None;
         let mut last_error = None;
         for root in roots.iter().rev() {
-            match root.verify(&directory) {
+            match root.verify(&pager) {
                 Ok(()) => {
                     selected = Some(root.clone());
                     break;
@@ -139,6 +154,7 @@ impl Database {
             .max(segments.last().unwrap().0.saturating_add(1));
         let mut db = Self {
             directory,
+            pager,
             _lock: lock,
             wal,
             catalog: root.catalog.clone(),
@@ -253,7 +269,7 @@ impl Database {
         self.definition(table)?;
         let current = match self.overlay.get(&(table, id)) {
             Some(data) => Some(data.current.clone()),
-            None => self.root.current(&self.directory, table, id)?,
+            None => self.root.current(&self.pager, table, id)?,
         };
         Ok(current.filter(|entity| !entity.deleted))
     }
@@ -264,7 +280,7 @@ impl Database {
         if let Some(data) = self.overlay.get(&(table, id)) {
             return data.at(definition, version, true);
         }
-        self.root.at(&self.directory, table, id, version, true)
+        self.root.at(&self.pager, table, id, version, true)
     }
     /// Replays retained history from its base through the current version.
     pub fn replay(&self, table: TableId, id: u64) -> Result<Entity> {
@@ -275,10 +291,9 @@ impl Database {
         }
         let current = self
             .root
-            .current(&self.directory, table, id)?
+            .current(&self.pager, table, id)?
             .ok_or_else(|| Error::NotFound(format!("entity {id}")))?;
-        self.root
-            .at(&self.directory, table, id, current.version, false)
+        self.root.at(&self.pager, table, id, current.version, false)
     }
     /// Replays retained history from its base through a specific version.
     pub fn replay_to_version(&self, table: TableId, id: u64, version: u64) -> Result<Entity> {
@@ -287,7 +302,7 @@ impl Database {
         if let Some(data) = self.overlay.get(&(table, id)) {
             return data.at(definition, version, false);
         }
-        self.root.at(&self.directory, table, id, version, false)
+        self.root.at(&self.pager, table, id, version, false)
     }
     /// Returns retained events in entity-version order.
     pub fn events(&self, table: TableId, id: u64) -> Result<Vec<Event>> {
@@ -310,11 +325,22 @@ impl Database {
         self.write(|tx| tx.retain_last(table, id, count))
     }
     /// Visits live entities in ID order. Records are loaded one at a time.
+    ///
+    /// The scan reads each record through the primary-index entry it already
+    /// holds, so visiting an entity costs one heap read rather than a second
+    /// descent through the tree.
     pub fn scan(&self, table: TableId, mut visit: impl FnMut(Entity) -> Result<()>) -> Result<()> {
         self.ready()?;
         self.definition(table)?;
-        self.visit_ids(table, |id| {
-            if let Some(entity) = self.get(table, id)? {
+        self.visit_entries(table, |id, locator| {
+            let entity = match self.overlay.get(&(table, id)) {
+                Some(data) => data.current.clone(),
+                None => {
+                    let locator = locator.ok_or_else(|| corrupt("scanned entity has no record"))?;
+                    self.root.state(&self.pager, table, 0, locator[0], id)?
+                }
+            };
+            if !entity.deleted {
                 visit(entity)?;
             }
             Ok(())
@@ -330,23 +356,34 @@ impl Database {
         if let Some(data) = self.overlay.get(&(table, id)) {
             return Ok(Some(data.clone()));
         }
-        self.root.entity(&self.directory, table, id)
+        self.root.entity(&self.pager, table, id)
     }
-    fn visit_ids(&self, table: TableId, mut visit: impl FnMut(u64) -> Result<()>) -> Result<()> {
-        let disk: Box<dyn Iterator<Item = Result<u64>>> = if self.root.catalog.contains_key(&table)
-        {
-            Box::new(
-                index::scan(
-                    &snapshot::file_path(&self.directory, table, self.root.generation, 3, 0),
-                    self.root.lsn,
-                    [0, 0],
-                    [u64::MAX, u64::MAX],
-                )?
-                .map(|entry| entry.map(|(key, _)| key[0])),
-            )
-        } else {
-            Box::new(std::iter::empty())
-        };
+    /// Visits every live identifier of a table in order, merging disk and overlay.
+    ///
+    /// The visitor also receives the primary-index entry of an entity that has
+    /// a checkpointed record, so a caller that only needs the current state can
+    /// read it directly instead of descending the tree a second time. `None`
+    /// marks an entity that exists only in the overlay.
+    fn visit_entries(
+        &self,
+        table: TableId,
+        mut visit: impl FnMut(u64, Option<index::Value>) -> Result<()>,
+    ) -> Result<()> {
+        let disk: Box<dyn Iterator<Item = Result<(u64, index::Value)>>> =
+            if self.root.catalog.contains_key(&table) {
+                Box::new(
+                    index::scan(
+                        &self.pager,
+                        self.root.file(table, 3),
+                        self.root.lsn,
+                        [0, 0],
+                        [u64::MAX, u64::MAX],
+                    )?
+                    .map(|entry| entry.map(|(key, value)| (key[0], value))),
+                )
+            } else {
+                Box::new(std::iter::empty())
+            };
         let mut disk = disk.peekable();
         let mut recent = self
             .overlay
@@ -358,24 +395,25 @@ impl Database {
             .peekable();
         loop {
             let old = match disk.peek() {
-                Some(Ok(id)) => Some(*id),
+                Some(Ok((id, value))) => Some((*id, *value)),
                 Some(Err(_)) => return Err(disk.next().unwrap().unwrap_err()),
                 None => None,
             };
             let new = recent.peek().copied();
-            let id = match (old, new) {
+            let id = match (old.map(|(id, _)| id), new) {
                 (None, None) => break,
                 (Some(a), Some(b)) => a.min(b),
                 (Some(a), None) => a,
                 (None, Some(b)) => b,
             };
-            if old == Some(id) {
+            let locator = old.filter(|&(old, _)| old == id).map(|(_, value)| value);
+            if locator.is_some() {
                 disk.next();
             }
             if new == Some(id) {
                 recent.next();
             }
-            visit(id)?;
+            visit(id, locator)?;
         }
         Ok(())
     }
@@ -410,7 +448,7 @@ impl Database {
                 self.options.history_segment_bytes,
                 self.options.compress_history,
             )?;
-            self.visit_ids(table, |id| {
+            self.visit_entries(table, |id, _| {
                 let data = self
                     .load(table, id)?
                     .ok_or_else(|| corrupt("entity vanished during checkpoint"))?;
@@ -449,6 +487,8 @@ impl Database {
         self.overlay.clear();
         self.poisoned = false;
         // Publication succeeded: cleanup errors do not invalidate acknowledged commits.
+        self.pager
+            .forget(|file| file.generation != previous && file.generation != generation);
         self.cleanup(previous, generation)?;
         fault("checkpoint-cleanup");
         Ok(())

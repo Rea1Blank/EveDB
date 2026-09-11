@@ -10,12 +10,13 @@ use crate::{
         frame,
         heap::{self, HeapWriter},
         index::{self, IndexWriter},
+        pager::{FileId, Pager, table_path},
     },
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek},
     path::{Path, PathBuf},
 };
 
@@ -109,46 +110,77 @@ impl Root {
             files,
         })
     }
-    pub fn verify(&self, directory: &Path) -> Result<()> {
+    /// Locates one non-segmented file of this generation.
+    pub(crate) fn file(&self, table: TableId, kind: u8) -> FileId {
+        FileId::new(table, self.generation, kind, 0)
+    }
+    /// Locates one history segment of this generation.
+    fn segment(&self, table: TableId, number: u64) -> FileId {
+        FileId::new(table, self.generation, 6, number)
+    }
+    pub fn verify(&self, pager: &Pager) -> Result<()> {
         for file in &self.files {
-            let (size, crc) = digest(&file_path(
-                directory,
+            let (size, crc) = digest(&pager.path(FileId::new(
                 file.table,
                 self.generation,
                 file.kind,
                 file.segment,
-            ))?;
+            )))?;
             if size != file.size || crc != file.crc {
                 return Err(corrupt("checkpoint file checksum mismatch"));
             }
         }
         Ok(())
     }
-    pub fn current(&self, directory: &Path, table: TableId, id: u64) -> Result<Option<Entity>> {
+    /// Reads the current state through the primary index, or `None` if absent.
+    pub fn current(&self, pager: &Pager, table: TableId, id: u64) -> Result<Option<Entity>> {
         if !self.catalog.contains_key(&table) {
             return Ok(None);
         }
-        let Some(value) = index::lookup(
-            &file_path(directory, table, self.generation, 3, 0),
-            self.lsn,
-            [id, 0],
-        )?
-        else {
+        let Some(value) = index::lookup(pager, self.file(table, 3), self.lsn, [id, 0])? else {
             return Ok(None);
         };
+        self.state(pager, table, 0, value[0], id).map(Some)
+    }
+    /// Reads one stored entity state and checks that it belongs to `id`.
+    pub(crate) fn state(
+        &self,
+        pager: &Pager,
+        table: TableId,
+        kind: u8,
+        location: u64,
+        id: u64,
+    ) -> Result<Entity> {
         let entity = decode_entity(&heap::read(
-            &file_path(directory, table, self.generation, 0, 0),
-            value[0],
+            pager,
+            self.file(table, kind),
+            location,
             self.lsn,
         )?)?;
         if entity.id != id {
-            return Err(corrupt("primary index references another entity"));
+            return Err(corrupt("index references another entity"));
         }
-        Ok(Some(entity))
+        Ok(entity)
+    }
+    /// Reads one framed event at a known segment location.
+    fn event_at(
+        &self,
+        pager: &Pager,
+        table: TableId,
+        location: index::Value,
+    ) -> Result<(u64, Event, u64)> {
+        let file = pager.file(self.segment(table, location[0]))?;
+        let record = frame::read_at(&file.file, location[1], file.len)?
+            .ok_or_else(|| corrupt("truncated indexed event"))?;
+        if record.kind != 3 {
+            return Err(corrupt("invalid history frame kind"));
+        }
+        let (entity_id, payload) = unpack(&record.payload)?;
+        Ok((entity_id, decode_event(&payload)?, record.lsn))
     }
     pub fn at(
         &self,
-        directory: &Path,
+        pager: &Pager,
         table: TableId,
         id: u64,
         version: u64,
@@ -158,23 +190,11 @@ impl Root {
             .catalog
             .get(&table)
             .ok_or_else(|| Error::NotFound(format!("entity {id}")))?;
-        let value = index::lookup(
-            &file_path(directory, table, self.generation, 3, 0),
-            self.lsn,
-            [id, 0],
-        )?
-        .ok_or_else(|| Error::NotFound(format!("entity {id}")))?;
-        let current = decode_entity(&heap::read(
-            &file_path(directory, table, self.generation, 0, 0),
-            value[0],
-            self.lsn,
-        )?)?;
-        let mut state = decode_entity(&heap::read(
-            &file_path(directory, table, self.generation, 1, 0),
-            value[1],
-            self.lsn,
-        )?)?;
-        if current.id != id || state.id != id || state.version > current.version {
+        let value = index::lookup(pager, self.file(table, 3), self.lsn, [id, 0])?
+            .ok_or_else(|| Error::NotFound(format!("entity {id}")))?;
+        let current = self.state(pager, table, 0, value[0], id)?;
+        let mut state = self.state(pager, table, 1, value[1], id)?;
+        if state.version > current.version {
             return Err(corrupt("invalid state reference"));
         }
         if version < state.version || version > current.version {
@@ -188,19 +208,13 @@ impl Root {
             if version == current.version {
                 return Ok(current);
             }
-            if let Some((key, location)) = index::floor(
-                &file_path(directory, table, self.generation, 5, 0),
-                self.lsn,
-                [id, version],
-            )? && key[0] == id
+            if let Some((key, location)) =
+                index::floor(pager, self.file(table, 5), self.lsn, [id, version])?
+                && key[0] == id
                 && key[1] >= state.version
             {
-                state = decode_entity(&heap::read(
-                    &file_path(directory, table, self.generation, 2, 0),
-                    location[0],
-                    self.lsn,
-                )?)?;
-                if state.id != id || state.version != key[1] {
+                state = self.state(pager, table, 2, location[0], id)?;
+                if state.version != key[1] {
                     return Err(corrupt("invalid snapshot identity"));
                 }
             }
@@ -208,29 +222,18 @@ impl Root {
         if state.version == version {
             return Ok(state);
         }
-        let mut segment: Option<(u64, File)> = None;
         for entry in index::scan(
-            &file_path(directory, table, self.generation, 4, 0),
+            pager,
+            self.file(table, 4),
             self.lsn,
             [id, state.version + 1],
             [id, version],
         )? {
             let (key, location) = entry?;
-            if segment.as_ref().map(|(n, _)| *n) != Some(location[0]) {
-                segment = Some((
-                    location[0],
-                    File::open(file_path(directory, table, self.generation, 6, location[0]))?,
-                ));
-            }
-            let file = &mut segment.as_mut().unwrap().1;
-            file.seek(SeekFrom::Start(location[1]))?;
-            let record = frame::read(file)?.ok_or_else(|| corrupt("truncated indexed event"))?;
-            let (entity_id, payload) = unpack(&record.payload)?;
-            let event = decode_event(&payload)?;
-            if record.kind != 3
-                || entity_id != id
+            let (entity_id, event, lsn) = self.event_at(pager, table, location)?;
+            if entity_id != id
                 || event.version != key[1]
-                || event.transaction != record.lsn
+                || event.transaction != lsn
                 || event.transaction > self.lsn
             {
                 return Err(corrupt("invalid indexed event identity"));
@@ -243,52 +246,31 @@ impl Root {
         Ok(state)
     }
 
-    pub fn entity(&self, directory: &Path, table: TableId, id: u64) -> Result<Option<EntityData>> {
+    pub fn entity(&self, pager: &Pager, table: TableId, id: u64) -> Result<Option<EntityData>> {
         if !self.catalog.contains_key(&table) {
             return Ok(None);
         }
-        let Some(value) = index::lookup(
-            &file_path(directory, table, self.generation, 3, 0),
-            self.lsn,
-            [id, 0],
-        )?
-        else {
+        let Some(value) = index::lookup(pager, self.file(table, 3), self.lsn, [id, 0])? else {
             return Ok(None);
         };
-        let current = decode_entity(&heap::read(
-            &file_path(directory, table, self.generation, 0, 0),
-            value[0],
-            self.lsn,
-        )?)?;
-        let base = decode_entity(&heap::read(
-            &file_path(directory, table, self.generation, 1, 0),
-            value[1],
-            self.lsn,
-        )?)?;
-        if current.id != id || base.id != id || base.version > current.version {
+        let current = self.state(pager, table, 0, value[0], id)?;
+        let base = self.state(pager, table, 1, value[1], id)?;
+        if base.version > current.version {
             return Err(corrupt("invalid current/base reference"));
         }
         let mut events = Vec::new();
         for item in index::scan(
-            &file_path(directory, table, self.generation, 4, 0),
+            pager,
+            self.file(table, 4),
             self.lsn,
             [id, 0],
             [id, u64::MAX],
         )? {
             let (key, location) = item?;
-            let mut file =
-                File::open(file_path(directory, table, self.generation, 6, location[0]))?;
-            file.seek(SeekFrom::Start(location[1]))?;
-            let record =
-                frame::read(&mut file)?.ok_or_else(|| corrupt("truncated history frame"))?;
-            if record.kind != 3 {
-                return Err(corrupt("invalid history frame kind"));
-            }
-            let (entity_id, payload) = unpack(&record.payload)?;
-            let event = decode_event(&payload)?;
+            let (entity_id, event, lsn) = self.event_at(pager, table, location)?;
             if entity_id != id
                 || event.version != key[1]
-                || event.transaction != record.lsn
+                || event.transaction != lsn
                 || event.transaction > self.lsn
             {
                 return Err(corrupt("history index references another event"));
@@ -297,19 +279,15 @@ impl Root {
         }
         let mut snapshots = BTreeMap::new();
         for item in index::scan(
-            &file_path(directory, table, self.generation, 5, 0),
+            pager,
+            self.file(table, 5),
             self.lsn,
             [id, 0],
             [id, u64::MAX],
         )? {
             let (key, location) = item?;
-            let state = decode_entity(&heap::read(
-                &file_path(directory, table, self.generation, 2, 0),
-                location[0],
-                self.lsn,
-            )?)?;
-            if state.id != id
-                || state.version != key[1]
+            let state = self.state(pager, table, 2, location[0], id)?;
+            if state.version != key[1]
                 || state.version < base.version
                 || state.version > current.version
             {
@@ -327,30 +305,6 @@ impl Root {
             return Err(corrupt("current state does not match its history"));
         }
         Ok(Some(data))
-    }
-}
-pub(crate) fn table_path(root: &Path, table: u64, generation: u64) -> PathBuf {
-    root.join("tables")
-        .join(format!("{table:020}"))
-        .join(format!("{generation:020}"))
-}
-pub(crate) fn file_path(
-    root: &Path,
-    table: u64,
-    generation: u64,
-    kind: u8,
-    segment: u64,
-) -> PathBuf {
-    let dir = table_path(root, table, generation);
-    match kind {
-        0 => dir.join("current.pages"),
-        1 => dir.join("bases.pages"),
-        2 => dir.join("snapshots.pages"),
-        3 => dir.join("primary.index"),
-        4 => dir.join("history.index"),
-        5 => dir.join("snapshots.index"),
-        6 => dir.join("history").join(format!("{segment:020}.events")),
-        _ => unreachable!("validated file kind"),
     }
 }
 pub(crate) fn digest(path: &Path) -> Result<(u64, u32)> {
@@ -461,7 +415,7 @@ impl TableWriter {
     ) -> Result<Self> {
         let dir = table_path(directory, table, generation);
         fs::create_dir_all(dir.join("history"))?;
-        let path = |kind| file_path(directory, table, generation, kind, 0);
+        let path = |kind| FileId::new(table, generation, kind, 0).path(directory);
         Ok(Self {
             current: HeapWriter::create(&path(0), lsn)?,
             bases: HeapWriter::create(&path(1), lsn)?,
@@ -492,13 +446,9 @@ impl TableWriter {
             if offset != 0 && offset + payload.len() as u64 + 40 > self.segment_limit {
                 self.history.sync_all()?;
                 self.segment += 1;
-                self.history = File::create_new(file_path(
-                    &self.directory,
-                    self.table,
-                    self.generation,
-                    6,
-                    self.segment,
-                ))?;
+                self.history = File::create_new(
+                    FileId::new(self.table, self.generation, 6, self.segment).path(&self.directory),
+                )?;
             }
             let offset = frame::append(&mut self.history, 3, event.transaction, &payload)?;
             self.history_index
@@ -519,13 +469,9 @@ impl TableWriter {
             .map(|kind| (kind, 0))
             .chain((0..=self.segment).map(|segment| (6, segment)));
         for (kind, segment) in kinds {
-            let (size, crc) = digest(&file_path(
-                &self.directory,
-                self.table,
-                self.generation,
-                kind,
-                segment,
-            ))?;
+            let (size, crc) = digest(
+                &FileId::new(self.table, self.generation, kind, segment).path(&self.directory),
+            )?;
             files.push(FileInfo {
                 table: self.table,
                 kind,
