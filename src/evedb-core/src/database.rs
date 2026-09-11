@@ -1005,15 +1005,14 @@ impl Staging {
         }
         let (table_id, id) = operation.entity_key().unwrap();
         let table = self.table(table_id)?.clone();
-        let existing = if let Some(data) = self.staged.get(&(table_id, id)) {
-            Some(data.clone())
-        } else if self.base.catalog.contains_key(&table_id) {
-            self.base.load(table_id, id)?
-        } else {
-            None
-        };
-        let data = if let Operation::Create(_, _, fields) = operation {
-            if existing.is_some() {
+        if !self.staged.contains_key(&(table_id, id))
+            && self.base.catalog.contains_key(&table_id)
+            && let Some(data) = self.base.load(table_id, id)?
+        {
+            self.staged.insert((table_id, id), data);
+        }
+        if let Operation::Create(_, _, fields) = operation {
+            if self.staged.contains_key(&(table_id, id)) {
                 return Err(Error::AlreadyExists(format!("entity {id}")));
             }
             let mut fields = fields.clone();
@@ -1025,14 +1024,19 @@ impl Staging {
                 deleted: false,
                 fields,
             };
-            EntityData {
+            let data = EntityData {
                 base: current.clone(),
                 current,
                 events: Vec::new(),
                 snapshots: BTreeMap::new(),
-            }
+            };
+            self.staged.insert((table_id, id), data);
+            return Ok(());
         } else {
-            let mut data = existing.ok_or_else(|| Error::NotFound(format!("entity {id}")))?;
+            let data = self
+                .staged
+                .get_mut(&(table_id, id))
+                .ok_or_else(|| Error::NotFound(format!("entity {id}")))?;
             match operation {
                 Operation::Apply(..) | Operation::Delete(..) => {
                     let fields = if let Operation::Apply(_, _, fields) = operation {
@@ -1078,9 +1082,7 @@ impl Staging {
                 }
                 _ => unreachable!(),
             }
-            data
-        };
-        self.staged.insert((table_id, id), data);
+        }
         Ok(())
     }
 }
@@ -1246,6 +1248,7 @@ fn encode_ops(operations: &[Operation]) -> Vec<u8> {
     }
     e.0
 }
+
 fn decode_ops(bytes: &[u8]) -> Result<Vec<Operation>> {
     let mut d = Decoder::new(bytes);
     let count = d.count(1)?;
@@ -1414,4 +1417,55 @@ fn io_fault(name: &str) -> std::io::Result<()> {
     #[cfg(not(feature = "fault-injection"))]
     let _ = name;
     Ok(())
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+    use crate::{DataType, Field, Value, test_support::TempDir};
+
+    #[test]
+    fn later_operations_reuse_owned_history_payloads_and_abort_safely() {
+        let dir = TempDir::new();
+        let mut db = Database::open(&dir.0).unwrap();
+        let table = db
+            .create_table(
+                "items",
+                Schema::new(vec![Field {
+                    id: 1,
+                    name: "bytes".into(),
+                    data_type: DataType::Bytes,
+                    nullable: false,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        db.create(table, 1, [(1, Value::Bytes(vec![1; 65536]))].into())
+            .unwrap();
+        let before = db.read_snapshot().unwrap();
+        let mut tx = db.transaction().unwrap();
+        tx.apply(table, 1, [(1, Value::Bytes(vec![2; 65536]))].into())
+            .unwrap();
+        tx.snapshot(table, 1).unwrap();
+        let pointers = |data: &mut Staging| -> Result<(usize, usize)> {
+            let entity = &data.staged[&(table, 1)];
+            let Value::Bytes(event) = &entity.events[0].fields[&1] else {
+                panic!("bytes")
+            };
+            let Value::Bytes(snapshot) = &entity.snapshots[&1].fields[&1] else {
+                panic!("bytes")
+            };
+            Ok((event.as_ptr() as usize, snapshot.as_ptr() as usize))
+        };
+        let original = tx.data.with(pointers).unwrap();
+        for _ in 0..20 {
+            tx.apply(table, 1, [(1, Value::Bytes(vec![3; 32]))].into())
+                .unwrap();
+        }
+        assert_eq!(tx.data.with(pointers).unwrap(), original);
+        assert_eq!(before.get(table, 1).unwrap().unwrap().version, 0);
+        assert!(tx.apply(table, 1, [(1, Value::Bool(true))].into()).is_err());
+        assert!(tx.commit().is_err());
+        assert_eq!(db.get(table, 1).unwrap().unwrap().version, 0);
+    }
 }

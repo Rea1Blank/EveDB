@@ -52,3 +52,13 @@ After writing begins it finishes synchronization/publication or returns an I/O
 outcome error, even if the deadline passes. A timeout never pretends to undo WAL
 bytes already written. The bounded commit queue stage replaces the temporary
 timed coordinator acquisition mechanism.
+
+## Transaction-owned staging
+
+An entity is materialized at most once into a transaction's private staging map.
+Subsequent operations mutate that private value directly. A failed operation
+still aborts the whole transaction, so cloning its complete history before each
+operation is unnecessary. Existing event payloads and acceleration snapshots keep
+their allocations across subsequent writes. The current row may still be copied
+for validation; initial loading of disk history is removed in the independent
+history stage. The WAL and published format are unchanged in this stage.
