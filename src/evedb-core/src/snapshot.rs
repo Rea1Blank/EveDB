@@ -18,6 +18,7 @@ use std::{
     fs::{self, File},
     io::{Read, Seek},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 /// One published generation and the checkpoint sequence stamped on its pages.
@@ -40,7 +41,7 @@ pub(crate) struct FileInfo {
 }
 /// How many entities one table left in one generation, and how many died since.
 ///
-/// An entity is written as a unit, so superseding it makes exactly one entity
+/// Current state/base form a unit, so superseding them makes exactly one entity
 /// of its former generation unreachable. Counting that at publication keeps the
 /// collector's decisions free of any scan.
 #[derive(Clone, Copy, Default)]
@@ -65,6 +66,8 @@ pub(crate) struct Root {
     /// Referenced generations in ascending order; a locator's slot indexes this.
     pub generations: Vec<GenerationInfo>,
     pub files: Vec<FileInfo>,
+    pub history_generations: BTreeMap<u64, u64>,
+    pub history_compacted: bool,
     /// Live and superseded entity counts per table and generation slot.
     pub occupancy: BTreeMap<(TableId, u8), Occupancy>,
 }
@@ -87,6 +90,8 @@ impl Root {
                 lsn: 0,
             }],
             files: Vec::new(),
+            history_generations: BTreeMap::new(),
+            history_compacted: true,
             occupancy: BTreeMap::new(),
         }
     }
@@ -102,6 +107,12 @@ impl Root {
         for entry in &self.generations {
             e.u64(entry.generation);
             e.u64(entry.lsn);
+        }
+        e.u8(u8::from(self.history_compacted));
+        e.u64(self.history_generations.len() as u64);
+        for (&generation, &lsn) in &self.history_generations {
+            e.u64(generation);
+            e.u64(lsn);
         }
         e.u64(self.files.len() as u64);
         for file in &self.files {
@@ -154,6 +165,23 @@ impl Root {
         {
             return Err(corrupt("invalid generation list"));
         }
+        let history_compacted = match d.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(corrupt("invalid history compaction flag")),
+        };
+        let n = d.count(16)?;
+        let mut history_generations = BTreeMap::new();
+        for _ in 0..n {
+            let at = d.u64()?;
+            let sequence = d.u64()?;
+            if at > generation
+                || sequence > lsn
+                || history_generations.insert(at, sequence).is_some()
+            {
+                return Err(corrupt("invalid history generation"));
+            }
+        }
         let n = d.count(37)?;
         let mut files = Vec::new();
         let mut seen = BTreeSet::new();
@@ -169,10 +197,14 @@ impl Root {
             if !catalog.contains_key(&file.table)
                 || file.kind > 6
                 || (file.kind != 6 && file.segment != 0)
-                || !generations
-                    .iter()
-                    .any(|entry| entry.generation == file.generation)
-                || (file.kind == 3 && file.generation != generation)
+                || (if matches!(file.kind, 2 | 6) {
+                    !history_generations.contains_key(&file.generation)
+                } else {
+                    !generations
+                        .iter()
+                        .any(|entry| entry.generation == file.generation)
+                })
+                || (matches!(file.kind, 3..=5) && file.generation != generation)
                 || !seen.insert((file.table, file.kind, file.generation, file.segment))
             {
                 return Err(corrupt("invalid checkpoint file reference"));
@@ -180,8 +212,10 @@ impl Root {
             files.push(file);
         }
         for id in catalog.keys() {
-            if !seen.contains(&(*id, 3, generation, 0)) {
-                return Err(corrupt("incomplete checkpoint manifest"));
+            for kind in 3..=5 {
+                if !seen.contains(&(*id, kind, generation, 0)) {
+                    return Err(corrupt("incomplete checkpoint manifest"));
+                }
             }
         }
         let n = d.count(25)?;
@@ -208,6 +242,8 @@ impl Root {
             catalog,
             generations,
             files,
+            history_generations,
+            history_compacted,
             occupancy,
         })
     }
@@ -276,12 +312,12 @@ impl Root {
     }
     /// Copies the file references that survive into the next manifest.
     ///
-    /// A primary index describes one manifest's whole key space, so the next
-    /// checkpoint always writes its own and never inherits one.
+    /// Indexes are rebuilt for the new manifest. Historical payload references
+    /// are collected separately while those indexes are written.
     pub(crate) fn kept_files(&self, absorb: &BTreeSet<u64>) -> Vec<FileInfo> {
         self.files
             .iter()
-            .filter(|file| file.kind != 3 && !absorb.contains(&file.generation))
+            .filter(|file| matches!(file.kind, 0 | 1) && !absorb.contains(&file.generation))
             .cloned()
             .collect()
     }
@@ -320,8 +356,8 @@ impl Root {
     }
     /// Reads the primary-index entry of an entity and checks its generation slot.
     ///
-    /// An entity is written as a unit, so its current state, base, snapshots and
-    /// events all live in the generation its locators name.
+    /// Current state and base share a generation slot. Historical payloads are
+    /// addressed independently through the newest historical indexes.
     fn locate(&self, pager: &Pager, table: TableId, id: u64) -> Result<Option<(u8, index::Value)>> {
         if !self.catalog.contains_key(&table) {
             return Ok(None);
@@ -353,12 +389,15 @@ impl Root {
         &self,
         pager: &Pager,
         table: TableId,
-        slot: u8,
         location: index::Value,
     ) -> Result<(u64, Event, u64)> {
-        let (id, _) = self.slotted(table, 6, slot, location[0])?;
+        if !self.history_generations.contains_key(&location[0]) {
+            return Err(corrupt("absent history generation"));
+        }
+        let (segment, offset) = event_split(location[1]);
+        let id = FileId::new(table, location[0], 6, segment);
         let file = pager.file(id)?;
-        let record = frame::read_at(&file.file, location[1], file.len)?
+        let record = frame::read_at(&file.file, offset, file.len)?
             .ok_or_else(|| corrupt("truncated indexed event"))?;
         if record.kind != 3 {
             return Err(corrupt("invalid history frame kind"));
@@ -374,15 +413,11 @@ impl Root {
         version: u64,
         snapshots: bool,
     ) -> Result<Entity> {
-        let definition = self
-            .catalog
-            .get(&table)
-            .ok_or_else(|| Error::NotFound(format!("entity {id}")))?;
-        let (slot, value) = self
+        let (_, value) = self
             .locate(pager, table, id)?
             .ok_or_else(|| Error::NotFound(format!("entity {id}")))?;
         let current = self.state(pager, table, 0, value[0], id)?;
-        let mut state = self.state(pager, table, 1, value[1], id)?;
+        let state = self.state(pager, table, 1, value[1], id)?;
         if state.version > current.version {
             return Err(corrupt("invalid state reference"));
         }
@@ -393,16 +428,31 @@ impl Root {
                 last: current.version,
             });
         }
+        if snapshots && version == current.version {
+            return Ok(current);
+        }
+        self.advance(pager, table, id, state, version, snapshots)
+    }
+    pub fn advance(
+        &self,
+        pager: &Pager,
+        table: TableId,
+        id: u64,
+        mut state: Entity,
+        version: u64,
+        snapshots: bool,
+    ) -> Result<Entity> {
+        let definition = self
+            .catalog
+            .get(&table)
+            .ok_or_else(|| Error::NotFound(format!("table {table}")))?;
         if snapshots {
-            if version == current.version {
-                return Ok(current);
-            }
-            let (file, lsn) = self.slotted(table, 5, slot, 0)?;
+            let (file, lsn) = (self.file(table, 5), self.lsn);
             if let Some((key, location)) = index::floor(pager, file, lsn, [id, version])?
                 && key[0] == id
                 && key[1] >= state.version
             {
-                state = self.state(pager, table, 2, location[0], id)?;
+                state = self.history_state(pager, table, location, id)?;
                 if state.version != key[1] {
                     return Err(corrupt("invalid snapshot identity"));
                 }
@@ -411,10 +461,10 @@ impl Root {
         if state.version == version {
             return Ok(state);
         }
-        let (file, lsn) = self.slotted(table, 4, slot, 0)?;
+        let (file, lsn) = (self.file(table, 4), self.lsn);
         for entry in index::scan(pager, file, lsn, [id, state.version + 1], [id, version])? {
             let (key, location) = entry?;
-            let (entity_id, event, lsn) = self.event_at(pager, table, slot, location)?;
+            let (entity_id, event, lsn) = self.event_at(pager, table, location)?;
             if entity_id != id
                 || event.version != key[1]
                 || event.transaction != lsn
@@ -430,20 +480,49 @@ impl Root {
         Ok(state)
     }
 
-    pub fn entity(&self, pager: &Pager, table: TableId, id: u64) -> Result<Option<EntityData>> {
-        let Some((slot, value)) = self.locate(pager, table, id)? else {
-            return Ok(None);
-        };
-        let current = self.state(pager, table, 0, value[0], id)?;
-        let base = self.state(pager, table, 1, value[1], id)?;
-        if base.version > current.version {
-            return Err(corrupt("invalid current/base reference"));
+    pub fn history_state(
+        &self,
+        pager: &Pager,
+        table: TableId,
+        location: index::Value,
+        id: u64,
+    ) -> Result<Entity> {
+        let lsn = self
+            .history_generations
+            .get(&location[0])
+            .ok_or_else(|| corrupt("absent snapshot generation"))?;
+        let entity = decode_entity(&heap::read(
+            pager,
+            FileId::new(table, location[0], 2, 0),
+            location[1],
+            *lsn,
+        )?)?;
+        if entity.id != id {
+            return Err(corrupt("snapshot references another entity"));
         }
+        Ok(entity)
+    }
+    pub fn events(
+        &self,
+        pager: &Pager,
+        table: TableId,
+        id: u64,
+        first: u64,
+        last: u64,
+    ) -> Result<Vec<Event>> {
         let mut events = Vec::new();
-        let (file, lsn) = self.slotted(table, 4, slot, 0)?;
-        for item in index::scan(pager, file, lsn, [id, 0], [id, u64::MAX])? {
+        if first > last {
+            return Ok(events);
+        }
+        for item in index::scan(
+            pager,
+            self.file(table, 4),
+            self.lsn,
+            [id, first],
+            [id, last],
+        )? {
             let (key, location) = item?;
-            let (entity_id, event, lsn) = self.event_at(pager, table, slot, location)?;
+            let (entity_id, event, lsn) = self.event_at(pager, table, location)?;
             if entity_id != id
                 || event.version != key[1]
                 || event.transaction != lsn
@@ -453,29 +532,35 @@ impl Root {
             }
             events.push(event);
         }
-        let mut snapshots = BTreeMap::new();
-        let (file, lsn) = self.slotted(table, 5, slot, 0)?;
-        for item in index::scan(pager, file, lsn, [id, 0], [id, u64::MAX])? {
-            let (key, location) = item?;
-            let state = self.state(pager, table, 2, location[0], id)?;
-            if state.version != key[1]
-                || state.version < base.version
-                || state.version > current.version
-            {
-                return Err(corrupt("invalid snapshot reference"));
-            }
-            snapshots.insert(key[1], state);
+        Ok(events)
+    }
+    pub fn entity(
+        self: &Arc<Self>,
+        pager: &Arc<Pager>,
+        table: TableId,
+        id: u64,
+    ) -> Result<Option<EntityData>> {
+        let Some((_, value)) = self.locate(pager, table, id)? else {
+            return Ok(None);
+        };
+        let current = self.state(pager, table, 0, value[0], id)?;
+        let base = self.state(pager, table, 1, value[1], id)?;
+        if base.version > current.version {
+            return Err(corrupt("invalid current/base reference"));
         }
-        let data = EntityData {
+        Ok(Some(EntityData {
+            disk: Some(Arc::new(crate::history::DiskHistory {
+                root: self.clone(),
+                pager: pager.clone(),
+                table,
+                through: current.version,
+            })),
             current,
             base,
-            events,
-            snapshots,
-        };
-        if data.at(&self.catalog[&table], data.current.version, false)? != data.current {
-            return Err(corrupt("current state does not match its history"));
-        }
-        Ok(Some(data))
+            events: Vec::new(),
+            committed: crate::ordered_map::OrderedMap::new(),
+            snapshots: crate::ordered_map::OrderedMap::new(),
+        }))
     }
 }
 /// Reads the generation slot shared by the locators of a primary-index entry.
@@ -593,6 +678,9 @@ pub(crate) struct TableWriter {
     generation: u64,
     slot: u8,
     entities: u64,
+    reused: BTreeMap<FileId, FileInfo>,
+    history_generations: BTreeMap<u64, u64>,
+    rewrite_history: bool,
 }
 impl TableWriter {
     #[allow(clippy::too_many_arguments)]
@@ -604,6 +692,7 @@ impl TableWriter {
         lsn: u64,
         limit: u64,
         compress: bool,
+        rewrite_history: bool,
     ) -> Result<Self> {
         let dir = table_path(directory, table, generation);
         fs::create_dir_all(dir.join("history"))?;
@@ -624,43 +713,159 @@ impl TableWriter {
             generation,
             slot,
             entities: 0,
+            reused: BTreeMap::new(),
+            history_generations: [(generation, lsn)].into(),
+            rewrite_history,
         })
     }
     /// Records an entity that already lives in a kept generation.
     ///
     /// Only the primary-index entry is rewritten, with its locators remapped to
     /// this manifest's generation slots. No record is copied.
-    pub fn carry(&mut self, id: u64, value: index::Value) -> Result<()> {
-        self.primary.append([id, 0], value)
+    pub fn carry(
+        &mut self,
+        id: u64,
+        value: index::Value,
+        root: &Root,
+        pager: &Pager,
+    ) -> Result<()> {
+        self.primary.append([id, 0], value)?;
+        self.copy_history(root, pager, id, 0, u64::MAX, None)
     }
-    /// Writes one whole entity into this generation.
-    pub fn append(&mut self, id: u64, data: &EntityData) -> Result<()> {
-        let slot = self.slot;
-        let current = heap::locate(slot, self.current.append(&encode_entity(&data.current))?);
-        let base = heap::locate(slot, self.bases.append(&encode_entity(&data.base))?);
-        self.primary.append([id, 0], [current, base])?;
-        self.entities += 1;
-        for (&version, state) in &data.snapshots {
-            let location = heap::locate(slot, self.snapshots.append(&encode_entity(state))?);
-            self.snapshot_index.append([id, version], [location, 0])?;
-        }
-        for event in &data.events {
-            let payload = pack(id, &encode_event(event), self.compress);
-            let offset = self.history.stream_position()?;
-            if offset != 0 && offset + payload.len() as u64 + 40 > self.segment_limit {
-                self.history.sync_all()?;
-                self.segment += 1;
-                self.history = File::create_new(
-                    FileId::new(self.table, self.generation, 6, self.segment).path(&self.directory),
-                )?;
-            }
-            let offset = frame::append(&mut self.history, 3, event.transaction, &payload)?;
-            self.history_index
-                .append([id, event.version], [self.segment, offset])?;
+    fn remember(&mut self, root: &Root, file: FileId) -> Result<()> {
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.reused.entry(file) {
+            let info = root
+                .files
+                .iter()
+                .find(|info| {
+                    FileId::new(info.table, info.generation, info.kind, info.segment) == file
+                })
+                .ok_or_else(|| corrupt("history references an unlisted file"))?;
+            entry.insert(info.clone());
+            self.history_generations.insert(
+                file.generation,
+                *root
+                    .history_generations
+                    .get(&file.generation)
+                    .ok_or_else(|| corrupt("absent history sequence"))?,
+            );
         }
         Ok(())
     }
-    pub fn finish(self) -> Result<(Vec<FileInfo>, u64)> {
+    fn copy_history(
+        &mut self,
+        root: &Root,
+        pager: &Pager,
+        id: u64,
+        base: u64,
+        last: u64,
+        overrides: Option<&EntityData>,
+    ) -> Result<()> {
+        for entry in index::scan(
+            pager,
+            root.file(self.table, 5),
+            root.lsn,
+            [id, base],
+            [id, last],
+        )? {
+            let (key, location) = entry?;
+            if overrides.is_some_and(|data| data.snapshots.contains_key(&key[1])) {
+                continue;
+            }
+            if self.rewrite_history {
+                let state = root.history_state(pager, self.table, location, id)?;
+                self.append_snapshot(id, &state)?;
+            } else {
+                self.remember(root, FileId::new(self.table, location[0], 2, 0))?;
+                self.snapshot_index.append(key, location)?;
+            }
+        }
+        if base >= last {
+            return Ok(());
+        }
+        for entry in index::scan(
+            pager,
+            root.file(self.table, 4),
+            root.lsn,
+            [id, base + 1],
+            [id, last],
+        )? {
+            let (key, location) = entry?;
+            if self.rewrite_history {
+                let (entity_id, event, lsn) = root.event_at(pager, self.table, location)?;
+                if entity_id != id || event.version != key[1] || event.transaction != lsn {
+                    return Err(corrupt("invalid collected event"));
+                }
+                self.append_event(id, &event)?;
+            } else {
+                self.remember(
+                    root,
+                    FileId::new(self.table, location[0], 6, event_split(location[1]).0),
+                )?;
+                self.history_index.append(key, location)?;
+            }
+        }
+        Ok(())
+    }
+    pub fn append(&mut self, id: u64, data: &EntityData) -> Result<()> {
+        let current = heap::locate(
+            self.slot,
+            self.current.append(&encode_entity(&data.current))?,
+        );
+        let base = heap::locate(self.slot, self.bases.append(&encode_entity(&data.base))?);
+        self.primary.append([id, 0], [current, base])?;
+        self.entities += 1;
+        if let Some(disk) = &data.disk
+            && data.base.version <= disk.through
+        {
+            self.copy_history(
+                &disk.root,
+                &disk.pager,
+                id,
+                data.base.version,
+                disk.through,
+                Some(data),
+            )?;
+        }
+        for (_, state) in data.snapshots.range(data.base.version..) {
+            self.append_snapshot(id, state)?;
+        }
+        for (_, event) in data.committed.range((
+            std::ops::Bound::Excluded(data.base.version),
+            std::ops::Bound::Unbounded,
+        )) {
+            self.append_event(id, event)?;
+        }
+        for event in &data.events {
+            self.append_event(id, event)?;
+        }
+        Ok(())
+    }
+    fn append_snapshot(&mut self, id: u64, state: &Entity) -> Result<()> {
+        let location = self.snapshots.append(&encode_entity(state))?;
+        self.snapshot_index
+            .append([id, state.version], [self.generation, location])
+    }
+    fn append_event(&mut self, id: u64, event: &Event) -> Result<()> {
+        let payload = pack(id, &encode_event(event), self.compress);
+        let offset = self.history.stream_position()?;
+        if offset != 0 && offset + payload.len() as u64 + 40 > self.segment_limit {
+            self.history.sync_all()?;
+            self.segment = self
+                .segment
+                .checked_add(1)
+                .ok_or_else(|| corrupt("history segment exhausted"))?;
+            self.history = File::create_new(
+                FileId::new(self.table, self.generation, 6, self.segment).path(&self.directory),
+            )?;
+        }
+        let offset = self.history.stream_position()?;
+        let location = event_location(self.segment, offset)?;
+        frame::append(&mut self.history, 3, event.transaction, &payload)?;
+        self.history_index
+            .append([id, event.version], [self.generation, location])
+    }
+    pub fn finish(self) -> Result<(Vec<FileInfo>, u64, BTreeMap<u64, u64>)> {
         let entities = self.entities;
         self.current.finish()?;
         self.bases.finish()?;
@@ -669,7 +874,7 @@ impl TableWriter {
         self.history_index.finish()?;
         self.snapshot_index.finish()?;
         self.history.sync_all()?;
-        let mut files = Vec::new();
+        let mut files: Vec<_> = self.reused.into_values().collect();
         let kinds = (0..6)
             .map(|kind| (kind, 0))
             .chain((0..=self.segment).map(|segment| (6, segment)));
@@ -691,6 +896,16 @@ impl TableWriter {
         sync_directory(&dir)?;
         sync_directory(dir.parent().unwrap())?;
         sync_directory(&self.directory.join("tables"))?;
-        Ok((files, entities))
+        Ok((files, entities, self.history_generations))
     }
+}
+
+fn event_location(segment: u64, offset: u64) -> Result<u64> {
+    if segment > u16::MAX as u64 || offset >= (1u64 << 48) {
+        return Err(Error::Invalid("history location exhausted".into()));
+    }
+    Ok((segment << 48) | offset)
+}
+fn event_split(location: u64) -> (u64, u64) {
+    (location >> 48, location & ((1u64 << 48) - 1))
 }

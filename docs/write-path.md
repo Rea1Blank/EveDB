@@ -104,3 +104,50 @@ Tests count actual WAL synchronizations internally, verify queue count/byte limi
 expiry and leadership handoff, check conflicting group members, and kill subprocesses
 or inject I/O failures around group writes and synchronization. The internal test
 counter is not a production metrics system.
+
+## Independent history and lazy staging
+
+`EVEDB003` separates current/base generation slots from immutable history file
+references. The latest history and snapshot indexes address absolute generations;
+the manifest records each historical generation's page sequence. Event locations
+use a 16-bit segment and 48-bit offset. Older control formats are rejected without
+rewriting existing data; a migration tool is not included in this series.
+
+Ordinary writes load only primary/current/base records. They carry a lazy disk
+history descriptor and share ordered trees of committed events and snapshots.
+New events remain private until their final commit sequence is known, then move
+into immutable shared nodes. Retention advances the base and removes tree prefixes;
+old readers keep their roots. Historical reads materialize only requested data,
+while `events()` necessarily returns an allocated vector of retained events.
+
+A transaction staged across a checkpoint rebinds its already committed history to
+the current checkpoint before publication. Write-conflict validation guarantees
+the equivalent entity view. It drops now-durable in-memory prefixes, preserves
+new events/explicit snapshots and keeps mutation charges during the transition.
+Pinned readers continue to reference complete immutable manifests; reclamation
+never depends on an unregistered historical file reference.
+
+Ordinary checkpoints rebuild primary/history/snapshot indexes, reuse existing
+payload files, and append new payloads. Current-state collection does not rewrite
+historical payloads. Explicit compaction also rewrites history when needed;
+repeated compaction reuses already compacted history to avoid duplicating it in
+the recovery baseline. Fully unreferenced files disappear after recovery/pinned
+views release them. Partially live historical segments need explicit compaction.
+`limits.max_history_files` bounds published event/snapshot payload files (4096 by
+default); exceeding it fails checkpoint publication without losing WAL commits.
+Compaction/retention or a deliberate configuration change can restore progress.
+
+Tests verify that updating an entity with 100 disk events opens only three current
+read files, committed payload pointers remain shared across writes, a small update
+writes only its new historical bytes, current generations can disappear while
+history survives, stale writers/readers survive compaction, retention reclaims
+released segments, format rejection preserves user files, and the file budget
+fails before publication. Prefix trimming/floor queries are checked against an
+ordered model with tree balance and old-root invariants.
+
+Remaining costs are explicit: synchronous maintenance, full index rebuilds,
+whole-file startup verification, caller-owned results and decoded-record memory.
+These changes remove major write amplification paths; they do not establish a
+production RPS claim. External metrics, load qualification, background maintenance,
+network serving, additional isolation levels, backup/upgrades and platform
+power-loss qualification remain the subsequent roadmap work.

@@ -25,6 +25,7 @@ use std::{
 #[derive(Clone)]
 pub(crate) struct ReadState {
     pub root: Arc<Root>,
+    pub pinned_bytes: Option<usize>,
     pub catalog: Arc<BTreeMap<TableId, Table>>,
     pub overlay: OrderedMap<(TableId, u64), Arc<EntityData>>,
     pub lsn: u64,
@@ -44,6 +45,15 @@ impl Drop for DirectoryLock {
     }
 }
 impl ReadState {
+    pub fn refresh_pinned_bytes(&mut self) {
+        let bytes = self.file_sizes().try_fold(0usize, |sum, (_, size)| {
+            sum.checked_add(usize::try_from(size).ok()?)
+        });
+        self.pinned_bytes = bytes;
+    }
+    pub fn file_sizes(&self) -> impl Iterator<Item = (FileId, u64)> + '_ {
+        self.root.file_sizes()
+    }
     pub(crate) fn ready(&self) -> Result<()> {
         if self.poisoned.load(Ordering::Acquire) {
             Err(Error::NeedsRecovery)
@@ -95,10 +105,9 @@ impl ReadState {
     /// Returns retained events in entity-version order.
     pub fn events(&self, table: TableId, id: u64) -> Result<Vec<Event>> {
         self.ready()?;
-        Ok(self
-            .load(table, id)?
+        self.load(table, id)?
             .ok_or_else(|| Error::NotFound(format!("entity {id}")))?
-            .events)
+            .all_events()
     }
     /// Returns the inclusive range of reconstructible entity versions.
     pub fn retained_range(&self, table: TableId, id: u64) -> Result<(u64, u64)> {
@@ -226,7 +235,7 @@ impl ReaderShared {
         let mut files = BTreeSet::new();
         pins.retain(|weak| {
             if let Some(pin) = weak.upgrade() {
-                files.extend(pin.state.root.file_ids());
+                files.extend(pin.state.file_sizes().map(|(file, _)| file));
                 true
             } else {
                 false
@@ -246,7 +255,7 @@ impl ReaderShared {
                         .oldest_sequence
                         .map_or(pin.state.lsn, |n| n.min(pin.state.lsn)),
                 );
-                files.extend(pin.state.root.file_sizes());
+                files.extend(pin.state.file_sizes());
                 true
             } else {
                 false
@@ -301,16 +310,10 @@ impl Reader {
             .read()
             .map_err(|_| Error::NeedsRecovery)?;
         state.ready()?;
-        let bytes = state
-            .root
-            .file_sizes()
-            .try_fold(0usize, |sum, (_, size)| {
-                sum.checked_add(usize::try_from(size).unwrap_or(usize::MAX))
-            })
-            .ok_or(Error::LimitExceeded {
-                resource: "pinned checkpoint bytes",
-                limit: state.resources.limits.max_pinned_bytes,
-            })?;
+        let bytes = state.pinned_bytes.ok_or(Error::LimitExceeded {
+            resource: "pinned checkpoint bytes",
+            limit: state.resources.limits.max_pinned_bytes,
+        })?;
         let permit = state.resources.snapshot(bytes)?;
         let data = Arc::new(SnapshotData {
             _permit: permit,

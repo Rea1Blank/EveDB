@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+#[cfg(test)]
+#[path = "history_tests.rs"]
+mod history_tests;
+
 use crate::{
     Entity, Error, Event, EventKind, Fields, ReadSnapshot, Result, Schema, SharedDatabase, Table,
     TableId,
@@ -56,7 +60,7 @@ pub struct Options {
     /// them. Superseding one makes its former copy unreachable, so a generation
     /// loses density over time; collecting it copies only what is still live.
     pub compact_live_ratio: f64,
-    /// Number of generations one manifest may reference, including the new one.
+    /// Current-state generations one manifest may reference, including the new one.
     ///
     /// Reaching the limit forces the cheapest generations into the checkpoint
     /// that publishes next, which bounds open files, startup verification, and
@@ -164,7 +168,7 @@ impl Database {
         if !directory.join("control").exists() {
             initialize(&directory)?;
         }
-        if fs::read(directory.join("control"))? != b"EVEDB002" {
+        if fs::read(directory.join("control"))? != b"EVEDB003" {
             return Err(corrupt("unsupported database control format"));
         }
         let segments = numbered_files(&directory.join("wal"), "wal")?;
@@ -221,12 +225,15 @@ impl Database {
             lsn: root.lsn,
             root: Arc::new(root),
             overlay: OrderedMap::new(),
+            pinned_bytes: Some(0),
             resources: Resources::new(options.limits.clone(), options.timeouts.clone())?,
             charges: OrderedMap::new(),
             pager: Arc::new(pager),
             _lock: Arc::new(lock),
             poisoned: Arc::new(AtomicBool::new(false)),
         });
+        let mut state = state;
+        Arc::make_mut(&mut state).refresh_pinned_bytes();
         let mut db = Self {
             directory,
             wal,
@@ -408,10 +415,10 @@ impl Database {
     pub fn snapshot_stats(&self) -> crate::SnapshotStats {
         self.readers.stats()
     }
-    /// Publishes every live entity into one new generation, releasing all others.
+    /// Collects all current states and fragmented live history in a full pass.
     ///
-    /// This is the collector's full pass: it reclaims every superseded record at
-    /// the cost of rewriting the database. Use it when space matters more than
+    /// Already compacted history is reused. Superseded records are reclaimed
+    /// once recovery and pinned readers release them. Use it when space matters more than
     /// the pause; an ordinary [`checkpoint`](Self::checkpoint) collects only the
     /// generations its policy selects.
     pub fn compact(&mut self) -> Result<()> {
@@ -422,7 +429,9 @@ impl Database {
             .iter()
             .map(|entry| (entry.generation, u64::MAX))
             .collect();
-        self.publish(all)
+        let rewrite_history =
+            !self.state.root.history_compacted || self.state.overlay.range(..).next().is_some();
+        self.publish(all, rewrite_history)
     }
     /// Reports the occupancy of each referenced generation, newest last.
     ///
@@ -452,7 +461,7 @@ impl Database {
     /// synchronous.
     pub fn checkpoint(&mut self) -> Result<()> {
         let plan = self.collection_plan();
-        self.publish(plan)
+        self.publish(plan, false)
     }
     /// Chooses how many live entities of each generation this checkpoint moves.
     ///
@@ -507,7 +516,7 @@ impl Database {
         }
         plan
     }
-    fn publish(&mut self, plan: BTreeMap<u64, u64>) -> Result<()> {
+    fn publish(&mut self, plan: BTreeMap<u64, u64>, rewrite_history: bool) -> Result<()> {
         self.ready()?;
         let generation = self.next_generation;
         self.next_generation = generation
@@ -542,6 +551,10 @@ impl Database {
             catalog: (*self.state.catalog).clone(),
             generations,
             files: self.state.root.kept_files(&absorb),
+            history_generations: BTreeMap::new(),
+            history_compacted: rewrite_history
+                || (self.state.root.history_compacted
+                    && self.state.overlay.range(..).next().is_none()),
             occupancy: self.state.root.kept_occupancy(&slots),
         };
         for &table in self.state.catalog.keys() {
@@ -553,6 +566,7 @@ impl Database {
                 self.state.lsn,
                 self.options.history_segment_bytes,
                 self.options.compress_history,
+                rewrite_history,
             )?;
             let occupancy = &mut root.occupancy;
             let quotas = &mut quotas;
@@ -569,7 +583,12 @@ impl Database {
                                 // Untouched, and its generation is not being
                                 // drained: the records stay where they are and
                                 // only the index entry moves.
-                                return writer.carry(id, snapshot::remap(value, slot));
+                                return writer.carry(
+                                    id,
+                                    snapshot::remap(value, slot),
+                                    &self.state.root,
+                                    &self.state.pager,
+                                );
                             }
                             if !touched {
                                 *quota -= 1;
@@ -584,7 +603,8 @@ impl Database {
                     .ok_or_else(|| corrupt("entity vanished during checkpoint"))?;
                 writer.append(id, &data)
             })?;
-            let (files, entities) = writer.finish()?;
+            let (files, entities, history_generations) = writer.finish()?;
+            root.history_generations.extend(history_generations);
             root.files.extend(files);
             root.occupancy
                 .entry((table, new_slot))
@@ -592,6 +612,14 @@ impl Database {
                 .entities += entities;
             fault("checkpoint-files");
         }
+        check(
+            "history files",
+            0,
+            root.file_ids()
+                .filter(|file| matches!(file.kind, 2 | 6))
+                .count(),
+            self.options.limits.max_history_files,
+        )?;
         let payload = root.encode();
         frame::append(&mut catalog_file, 4, self.state.lsn, &payload)?;
         catalog_file.sync_all()?;
@@ -626,6 +654,7 @@ impl Database {
         let previous = std::mem::replace(&mut state.root, Arc::new(root));
         self.wal = wal;
         Arc::make_mut(&mut self.state).overlay.clear();
+        Arc::make_mut(&mut self.state).refresh_pinned_bytes();
         Arc::make_mut(&mut self.state).charges.clear();
         self.readers.publish(self.state.clone());
         // Publication succeeded: cleanup errors do not invalidate acknowledged commits.
@@ -865,6 +894,8 @@ impl Staging {
     fn prepare(self, deadline: Option<std::time::Instant>) -> Prepared {
         Prepared {
             base_sequence: self.base.lsn,
+            root_generation: self.base.root.generation,
+            _history_charges: self.base.charges.clone(),
             catalog: self.catalog,
             staged: self.staged,
             operations: self.operations,
@@ -1038,7 +1069,9 @@ impl Staging {
                 base: current.clone(),
                 current,
                 events: Vec::new(),
-                snapshots: BTreeMap::new(),
+                snapshots: OrderedMap::new(),
+                committed: OrderedMap::new(),
+                disk: None,
             };
             self.staged.insert((table_id, id), data);
             return Ok(());
@@ -1088,7 +1121,7 @@ impl Staging {
                 )?,
                 Operation::Snapshot(..) => {
                     data.snapshots
-                        .insert(data.current.version, data.current.clone());
+                        .insert(data.current.version, Arc::new(data.current.clone()));
                 }
                 _ => unreachable!(),
             }
@@ -1102,6 +1135,8 @@ pub(crate) struct Prepared {
     pub deadline: Option<std::time::Instant>,
     reservation: Reservation,
     pub base_sequence: u64,
+    root_generation: u64,
+    _history_charges: OrderedMap<u64, Arc<Reservation>>,
     catalog: Arc<BTreeMap<TableId, Table>>,
     staged: BTreeMap<(TableId, u64), EntityData>,
     operations: Vec<Operation>,
@@ -1133,6 +1168,26 @@ impl Prepared {
                 && db.state.lsn > db.state.root.lsn
             {
                 db.checkpoint()?;
+            }
+            // A checkpoint may have moved the history while this transaction
+            // was staged. Rebind to the now-durable equivalent before publishing;
+            // conflict validation guarantees no intervening write to these keys.
+            for (_, batch) in &mut active {
+                if batch.root_generation != db.state.root.generation {
+                    for (&(table, id), data) in &mut batch.staged {
+                        if let Some(persisted) = db.state.root.entity(&db.state.pager, table, id)? {
+                            let through = persisted.current.version;
+                            if let Some(first) = through.checked_add(1) {
+                                data.committed.retain_from(&first);
+                            } else {
+                                data.committed.clear();
+                            }
+                            data.snapshots.retain_from(&through);
+                            data.disk = persisted.disk;
+                        }
+                    }
+                    batch.root_generation = db.state.root.generation;
+                }
             }
             loop {
                 active.retain(|(index, batch)| {
@@ -1223,7 +1278,10 @@ impl Prepared {
         self.publish_state(db, lsn);
         db.readers.publish(db.state.clone());
     }
-    fn publish_state(self, db: &mut Database, lsn: u64) {
+    fn publish_state(mut self, db: &mut Database, lsn: u64) {
+        for data in self.staged.values_mut() {
+            data.seal();
+        }
         let state = Arc::make_mut(&mut db.state);
         state.charges.insert(lsn, Arc::new(self.reservation));
         state.catalog = self.catalog;
@@ -1407,7 +1465,7 @@ fn initialize(directory: &Path) -> Result<()> {
     frame::append(&mut wal, 1, 0, &payload)?;
     wal.sync_all()?;
     let mut control = File::create_new(directory.join("control"))?;
-    control.write_all(b"EVEDB002")?;
+    control.write_all(b"EVEDB003")?;
     control.sync_all()?;
     snapshot::sync_directory(&directory.join("catalog"))?;
     snapshot::sync_directory(&directory.join("wal"))?;
@@ -1518,7 +1576,7 @@ mod staging_tests {
             let Value::Bytes(event) = &entity.events[0].fields[&1] else {
                 panic!("bytes")
             };
-            let Value::Bytes(snapshot) = &entity.snapshots[&1].fields[&1] else {
+            let Value::Bytes(snapshot) = &entity.snapshots.get(&1).unwrap().fields[&1] else {
                 panic!("bytes")
             };
             Ok((event.as_ptr() as usize, snapshot.as_ptr() as usize))

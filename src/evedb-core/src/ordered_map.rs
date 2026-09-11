@@ -48,6 +48,22 @@ impl<K, V> OrderedMap<K, V> {
     }
 }
 impl<K: Ord + Clone, V: Clone> OrderedMap<K, V> {
+    pub fn floor(&self, key: &K) -> Option<(&K, &V)> {
+        let mut current = self.root.as_deref();
+        let mut result = None;
+        while let Some(node) = current {
+            if node.key <= *key {
+                result = Some((&node.key, &node.value));
+                current = node.right.as_deref();
+            } else {
+                current = node.left.as_deref();
+            }
+        }
+        result
+    }
+    pub fn retain_from(&mut self, key: &K) {
+        self.root = retain_from(&self.root, key);
+    }
     pub fn get(&self, key: &K) -> Option<&V> {
         let mut current = self.root.as_deref();
         while let Some(node) = current {
@@ -87,6 +103,45 @@ impl<K: Ord + Clone, V: Clone> OrderedMap<K, V> {
             Bound::Unbounded => Bound::Unbounded,
         };
         Range { stack, end }
+    }
+}
+fn join<K: Clone, V: Clone>(
+    left: Link<K, V>,
+    key: K,
+    value: V,
+    right: Link<K, V>,
+) -> Arc<Node<K, V>> {
+    if height(&left) > height(&right) + 1 {
+        let top = left.as_ref().unwrap();
+        balance(node(
+            top.key.clone(),
+            top.value.clone(),
+            top.left.clone(),
+            Some(join(top.right.clone(), key, value, right)),
+        ))
+    } else if height(&right) > height(&left) + 1 {
+        let top = right.as_ref().unwrap();
+        balance(node(
+            top.key.clone(),
+            top.value.clone(),
+            Some(join(left, key, value, top.left.clone())),
+            top.right.clone(),
+        ))
+    } else {
+        node(key, value, left, right)
+    }
+}
+fn retain_from<K: Ord + Clone, V: Clone>(root: &Link<K, V>, key: &K) -> Link<K, V> {
+    let top = root.as_ref()?;
+    if top.key < *key {
+        retain_from(&top.right, key)
+    } else {
+        Some(join(
+            retain_from(&top.left, key),
+            top.key.clone(),
+            top.value.clone(),
+            top.right.clone(),
+        ))
     }
 }
 impl<K: Ord + Clone, V: Clone> Extend<(K, V)> for OrderedMap<K, V> {
@@ -211,6 +266,31 @@ mod tests {
         collections::BTreeMap,
         sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
     };
+    #[test]
+    fn prefix_removal_and_floor_preserve_balance_and_old_roots() {
+        let mut original = OrderedMap::new();
+        for key in 0..2048 {
+            original.insert(key, key);
+        }
+        for threshold in 0..=2048 {
+            let mut map = original.clone();
+            map.retain_from(&threshold);
+            validate(&map.root, None, None);
+            assert_eq!(
+                map.range(..).map(|(&key, _)| key).collect::<Vec<_>>(),
+                (threshold..2048).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                map.floor(&threshold.saturating_sub(1)).map(|(&key, _)| key),
+                if threshold == 0 { Some(0) } else { None }
+            );
+            assert_eq!(
+                map.floor(&4096).map(|(&key, _)| key),
+                (threshold < 2048).then_some(2047)
+            );
+        }
+        assert_eq!(original.range(..).count(), 2048);
+    }
     fn validate(root: &Link<u64, u64>, lower: Option<u64>, upper: Option<u64>) -> usize {
         let Some(node) = root else {
             return 0;
