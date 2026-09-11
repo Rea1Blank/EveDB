@@ -50,7 +50,7 @@ rename keeps the table ID and physical identity.
 
 ```text
 data/
-  control                              format marker EVEDB002
+  control                              format marker EVEDB003
   LOCK                                 exclusive OS lock
   catalog/
     <generation>.catalog               schemas, file sizes and CRC32C checksums
@@ -62,8 +62,8 @@ data/
       bases.pages                      retained reconstruction bases
       snapshots.pages                  optional acceleration states
       primary.index                    entity -> current/base locations
-      history.index                    (entity, version) -> segment/offset
-      snapshots.index                  (entity, version) -> snapshot location
+      history.index                    (entity, version) -> generation + segment/offset
+      snapshots.index                  (entity, version) -> generation + snapshot location
       history/
         <segment-id>.events             sequential framed event records
 ```
@@ -77,11 +77,15 @@ next manifest is a table lookup rather than a rewrite. A heap locator therefore
 combines a generation slot, a page ID and a slot ID; entity IDs remain
 independent of those locations.
 
-An entity is written as a unit: its current state, retained base, snapshots and
-events are produced by one checkpoint and live together in one generation. The
-primary index names that generation, so reading any part of an entity takes one
-descent and no search across generations. Writing an entity again moves the whole
-unit into the new generation and leaves its former copy unreachable.
+Current state and retained base move together; immutable event payloads and
+acceleration snapshots have independent lifetimes. The newest primary, history
+and snapshot indexes route directly to their files. History references use an
+absolute generation number; event locations pack a 16-bit segment and 48-bit byte
+offset, while snapshot locations carry a raw heap locator. The manifest records
+historical page sequences independently of current-state generation slots.
+Ordinary checkpoints copy index references and append new payloads. They do not
+rewrite old event payloads when a current record moves. EVEDB003 rejects older
+control formats explicitly; no automatic migration or data deletion is performed.
 
 Current rows use an 8 KiB slotted heap and a separate B+tree primary index. The
 tree is bulk-built bottom-up during a checkpoint; transactional writes first
@@ -164,11 +168,9 @@ outcome. A checkpoint failure after publication starts also requires recovery.
 Checkpointing proceeds as follows:
 
 1. Reserve a new generation and choose which referenced generations to collect.
-2. Write the heap, event and index files of entities this checkpoint produces:
-   the ones a transaction touched, plus every live entity of a collected
-   generation. An entity that neither applies to keeps its records where they
-   are; only its primary-index entry is rewritten, with its generation slot
-   translated.
+2. Write changed/collected current states and bases; carry untouched records.
+   Rebuild primary/history/snapshot indexes, reuse referenced immutable history
+   files, and append only new events and acceleration snapshots.
 3. Synchronize the files and write a checked catalog/manifest listing the files
    of every referenced generation with their sizes and whole-file checksums.
 4. Create a new WAL segment whose first frame contains that complete root;
@@ -196,17 +198,17 @@ Sharing files changes what the retained checkpoint can repair. It is no longer a
 independent copy of the database: an entity that has not moved is read from the
 same file by both manifests, so damage to that file fails both and recovery
 reports corruption instead of falling back. The retained checkpoint still covers
-a damaged file that the newest checkpoint wrote itself. `compact` rewrites
-everything into one generation, which makes the published checkpoint independent
-again from that point on. A full backup therefore has to copy the files of every
-referenced generation, not the newest directory.
+a damaged file that the newest checkpoint wrote itself. Compaction can rewrite
+history, but repeated compaction reuses already compacted history. A backup must
+copy every file named by the manifest; compaction does not promise an independent
+backup or repair damage to a shared file.
 
 ## Collecting generations
 
 A new generation leaves the previous copy of every entity it rewrites
 unreachable, so density has to be tracked and recovered. The manifest counts, per
 table and generation, how many entities were written there and how many later
-checkpoints have superseded. An entity is a unit, so superseding one changes the
+checkpoints have superseded. Current state/base form one unit, so superseding one changes the
 count by exactly one: publication maintains these counters without reading a file,
 and the collector decides without a scan.
 
@@ -214,8 +216,8 @@ A checkpoint collects a generation when its live share falls below
 `compact_live_ratio`, when nothing live remains in it, or when the manifest's
 generation budget (`max_generations`) needs a slot, in which case the generation
 with the fewest live entities goes first because it costs the least to copy.
-Collecting means rewriting its live entities into the new generation; its files
-are then unreferenced and the next publication deletes them. The policy reads the
+Collecting moves live current states and bases. Referenced event/snapshot files
+survive independently; unreferenced files can be reclaimed on publication. The policy reads the
 published manifest, so a generation that loses density during one checkpoint is
 collected by the next.
 
@@ -230,9 +232,10 @@ up. Only the format's 256 slots are absolute: reaching them overrides the pause
 budget. `compact` ignores the budget by definition — it is the explicit request
 for one full pass.
 
-The budget is what bounds the design: without it a chain of generations would
-grow open descriptors, startup verification, manifest size and the residue of
-superseded records. It does not bound the read path — the primary index is
+The generation budget bounds current-state fragmentation. History payload files
+have a separate admission limit (4096 by default), independent of retained data
+size. A checkpoint exceeding it fails before publication; explicit compaction
+and retention allow progress without silently discarding acknowledged history. It does not bound the read path — the primary index is
 rebuilt in full by every checkpoint and names each entity's generation directly,
 so a point read costs one descent no matter how long the chain is.
 
@@ -245,9 +248,9 @@ Retaining N events advances the base to `current_version - N` when necessary.
 Retaining zero events stores the current state as the new base. Versions never
 reset. Logical removal is immediate, while physical reclamation needs checkpoints;
 the preceding recovery generation can keep older history until another checkpoint.
-Dropped events keep occupying their segment until the collector rewrites that
-generation, and the entity that dropped them is rewritten whole. This is not
-secure erasure of old bytes.
+A fully unreferenced segment can be deleted after current/recovery/pinned views
+release it. A partially live segment keeps obsolete bytes until explicit history
+compaction rewrites its live records. This is not secure erasure.
 
 ## Defaults, costs, and current limits
 
@@ -263,7 +266,7 @@ secure erasure of old bytes.
 | Open checkpoint files | 256 descriptors |
 | Collection threshold | Collect a generation below 0.5 live entities |
 | Collection budget | 8192 entities copied per checkpoint; zero removes the cap |
-| Generation budget | 8 referenced generations per manifest; 256 is the format limit |
+| Generation budget | 8 current-state generations per manifest; 256 current-state slots |
 | Heap file size | 2^40 pages, since a locator spends one byte on its generation slot |
 | Fields per schema | 1..=4096; IDs nonzero and unique |
 | Table/field name length | 1..=255 UTF-8 bytes, without control characters |
@@ -278,26 +281,21 @@ OS caches, storage-controller caches, or arbitrary sector tearing. Failed first
 initialization can leave a directory needing manual inspection before reuse.
 Use disposable data while these guarantees and formats mature.
 
-Checkpoints are synchronous and still hold three costs proportional to the whole
-database rather than to the changes. The primary index is rebuilt in full, which
-writes one entry per live entity; that is the floor of a checkpoint, and removing
-it needs a partitioned primary index rather than a policy change. Startup streams
-every referenced file to verify its checksum. `compact` rewrites everything by
-definition.
-
-An entity is the unit of rewriting, so touching one rewrites its whole retained
-history, not the new events alone. A long-lived entity that changes often is
-therefore the worst case, and retention is what bounds it. Density is counted in
-entities rather than bytes, which keeps collection decisions free of I/O but
-misjudges a table whose records differ wildly in size.
+Checkpoints remain synchronous. Primary/history/snapshot indexes are rebuilt in
+full; event payload copying has been removed, but index construction still scales
+with the number of indexed records. Partitioned indexes and background maintenance
+remain separate work. Startup verifies every referenced file's checksum. Explicit
+compaction may rewrite all live history and can pause writers for substantial I/O.
+Current-state density is counted in entities rather than bytes.
 
 A bounded cache holds decoded checkpoint pages and open descriptors; because a
 published page never changes, it is validated once when it enters the cache
 rather than on every read, and a file that no manifest references is dropped from
 the cache before it is deleted. The cache budget is a page count derived from
-`cache_bytes` and does not bound the rest of engine memory. A changed entity's
-whole retained history is loaded into memory; transactions stage all touched
-entities, and recovery builds the overlay from the remaining WAL. The WAL size
+`cache_bytes` and does not bound the rest of engine memory. Ordinary writes load
+current/base records and carry a lazy history descriptor. In-memory committed
+events and snapshots share immutable ordered trees. Historical reads and explicit
+compaction load the requested history; recovery rebuilds recent events from WAL. The WAL size
 target is not a hard memory bound. Index construction retains one separator per
 leaf before building parent levels, so its memory also grows with index size.
 `events` returns an allocated vector. Large histories can therefore be expensive

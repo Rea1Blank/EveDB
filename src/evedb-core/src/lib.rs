@@ -14,6 +14,7 @@ mod commit_queue;
 mod database;
 mod deadline;
 mod error;
+mod history;
 mod model;
 mod ordered_map;
 mod reader;

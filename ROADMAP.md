@@ -72,10 +72,12 @@ steps 1–3; subsequent steps are release requirements, not a claim that the fir
 delivery qualifies for production.
 
 Steps 1–3 are implemented. See [concurrent transactions](docs/transactions.md)
-for the API, exact guarantees, failure semantics, and remaining limits. Step 4
-is next; no production throughput SLO has been qualified yet.
+for the API, guarantees and failure semantics. The authorized write-path series
+(budgets, expiry, staging, shared overlay, group commit and independent history)
+is implemented. External metrics/load qualification remain deferred; no production
+throughput SLO has been qualified yet.
 
-The next authorized implementation series is detailed in
+The completed authorized implementation series is detailed in
 [write-path implementation](docs/write-path.md): budgets, deadlines, staging,
 shared overlay, group commit, and independent history storage. External metrics
 and the load harness are deferred to a separate workstream rather than gating
@@ -104,7 +106,7 @@ and cross-table batches, and short/long history. Include warm/cold and
 larger-than-RAM datasets with an enforced memory budget. Record machine,
 storage, filesystem, build, and options.
 
-Before throughput work, measure a baseline and commit a hardware-specific SLO
+For the later qualification workstream, measure a baseline and commit a hardware-specific SLO
 profile with numeric RPS, p95/p99 latency, error budget, and recovery-time targets.
 Use open-loop arrivals as well as saturation tests; report queue time, conflicts,
 retries, rejections, durable commits, and successful operations separately.

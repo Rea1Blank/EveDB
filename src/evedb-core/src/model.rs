@@ -208,12 +208,15 @@ pub struct Event {
     pub fields: Fields,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub(crate) struct EntityData {
     pub current: Entity,
     pub base: Entity,
+    // Only this transaction's new events are mutable. Published payloads are shared.
     pub events: Vec<Event>,
-    pub snapshots: BTreeMap<u64, Entity>,
+    pub committed: crate::ordered_map::OrderedMap<u64, std::sync::Arc<Event>>,
+    pub snapshots: crate::ordered_map::OrderedMap<u64, std::sync::Arc<Entity>>,
+    pub disk: Option<std::sync::Arc<crate::history::DiskHistory>>,
 }
 impl EntityData {
     pub fn at(&self, table: &Table, version: u64, use_snapshots: bool) -> Result<Entity> {
@@ -224,17 +227,41 @@ impl EntityData {
                 last: self.current.version,
             });
         }
-        let mut state = if use_snapshots {
-            self.snapshots
-                .range(..=version)
-                .next_back()
-                .map(|(_, s)| s)
-                .unwrap_or(&self.base)
-                .clone()
-        } else {
-            self.base.clone()
-        };
-        for event in self.events.iter().filter(|e| e.version <= version) {
+        if use_snapshots && version == self.current.version {
+            return Ok(self.current.clone());
+        }
+        let mut state = self.base.clone();
+        if use_snapshots
+            && let Some((_, snapshot)) = self.snapshots.floor(&version)
+            && snapshot.version >= state.version
+        {
+            state = (**snapshot).clone();
+        }
+        if let Some(disk) = &self.disk
+            && state.version < version.min(disk.through)
+        {
+            state = if use_snapshots && version >= disk.through {
+                disk.root
+                    .current(&disk.pager, disk.table, self.current.id)?
+                    .ok_or_else(|| corrupt("history source disappeared"))?
+            } else {
+                disk.root.advance(
+                    &disk.pager,
+                    disk.table,
+                    self.current.id,
+                    state,
+                    version.min(disk.through),
+                    use_snapshots,
+                )?
+            };
+        }
+        for (_, event) in self.committed.range((
+            std::ops::Bound::Excluded(state.version),
+            std::ops::Bound::Included(version),
+        )) {
+            apply_event(&mut state, event, table)?;
+        }
+        for event in self.events.iter().filter(|event| event.version <= version) {
             if event.version > state.version {
                 apply_event(&mut state, event, table)?;
             }
@@ -244,16 +271,56 @@ impl EntityData {
         }
         Ok(state)
     }
+    pub fn all_events(&self) -> Result<Vec<Event>> {
+        let mut events = if let Some(disk) = &self.disk
+            && self.base.version < disk.through
+        {
+            disk.root.events(
+                &disk.pager,
+                disk.table,
+                self.current.id,
+                self.base.version.saturating_add(1),
+                disk.through,
+            )?
+        } else {
+            Vec::new()
+        };
+        events.extend(
+            self.committed
+                .range((
+                    std::ops::Bound::Excluded(self.base.version),
+                    std::ops::Bound::Unbounded,
+                ))
+                .map(|(_, event)| (**event).clone()),
+        );
+        events.extend(
+            self.events
+                .iter()
+                .filter(|event| event.version > self.base.version)
+                .cloned(),
+        );
+        Ok(events)
+    }
     pub fn retain(&mut self, table: &Table, count: usize) -> Result<()> {
-        let remove = self.events.len().saturating_sub(count);
-        if remove == 0 {
+        let version = self.current.version.saturating_sub(count as u64);
+        if version <= self.base.version {
             return Ok(());
         }
-        let version = self.events[remove - 1].version;
-        self.base = self.at(table, version, false)?;
-        self.events.drain(..remove);
-        self.snapshots.retain(|&v, _| v >= version);
+        self.base = self.at(table, version, true)?;
+        self.events.retain(|event| event.version > version);
+        if let Some(first) = version.checked_add(1) {
+            self.committed.retain_from(&first);
+        } else {
+            self.committed.clear();
+        }
+        self.snapshots.retain_from(&version);
         Ok(())
+    }
+    pub fn seal(&mut self) {
+        for event in self.events.drain(..) {
+            self.committed
+                .insert(event.version, std::sync::Arc::new(event));
+        }
     }
 }
 

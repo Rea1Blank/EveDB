@@ -25,6 +25,9 @@ pub struct Limits {
     pub max_queued_commits: usize,
     /// Encoded mutation bytes in waiting and currently syncing commit requests.
     pub max_queued_commit_bytes: usize,
+    /// History payload files (events and snapshots) in a newly published checkpoint.
+    /// Reaching this bound requires compaction or explicit retention before checkpointing.
+    pub max_history_files: usize,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -37,12 +40,14 @@ impl Default for Limits {
             max_resident_write_bytes: 512 * 1024 * 1024,
             max_queued_commits: 256,
             max_queued_commit_bytes: 128 * 1024 * 1024,
+            max_history_files: 4096,
         }
     }
 }
 impl Limits {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.max_transactions == 0
+            || self.max_history_files == 0
             || self.max_queued_commits == 0
             || self.max_queued_commit_bytes < self.max_transaction_bytes
             || self.max_snapshots == 0

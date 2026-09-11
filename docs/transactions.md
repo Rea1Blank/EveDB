@@ -70,16 +70,17 @@ snapshots are gone. Snapshots can retain history the latest view has pruned.
 
 This is the concurrency foundation, not throughput or production qualification:
 
-- Every commit still performs its own WAL synchronization. Maintenance runs
-  synchronously under coordination; independent readers continue but commits
-  wait behind it.
-- Copy-on-write publication copies an overlay map; staging loads whole retained
-  entities. Large histories and overlays still increase CPU/memory cost.
-- Conflict metadata tracks changed keys. Explicit checkpoint/compact prunes
-  revisions older than every active snapshot. Long-lived pins can retain this
-  metadata and files; hard limits and automatic admission control are pending.
-- Serializable read/predicate checks, ReadCommitted refresh, network sessions,
-  cancellation, bounded queues, and group commit are sequenced in the roadmap.
+- Shared commits use a bounded count/byte queue and can share one WAL sync.
+  Maintenance remains synchronous under coordination.
+- Publication shares overlay paths and unchanged catalogs. Ordinary staging
+  reads current/base state; committed event payloads and disk history are shared.
+- Transaction/snapshot limits, monotonic deadlines and abandoned-handle expiry
+  are implemented. Byte accounting covers accepted encoded mutations, not RSS.
+- ReadCommitted, Serializable, network sessions, durable request outcomes,
+  background maintenance and sustained throughput qualification remain pending.
+
+See [the write path](write-path.md) for the exact budgets, queue semantics,
+independent history format, regression tests and remaining costs.
 
 Tests cover synchronized writers, disjoint and conflicting keys, catalog
 conflicts, retention across compaction, abort/retry, commit sequence stamping,
