@@ -1,9 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Core library for EveDB.
+//! Local storage engine for EveDB's typed entities and versioned events.
 //!
-//! This crate is the starting point for the database engine. Storage, queries,
-//! transactions, and networking are not implemented yet.
+//! [`Database`] provides atomic cross-table writes, indexed current and historical
+//! reads, replay, retention, and checkpoint/WAL recovery. The byte formats and
+//! public API are experimental; no on-disk compatibility is promised yet.
+
+pub mod storage;
+
+mod checksum;
+mod codec;
+mod database;
+mod error;
+mod model;
+mod snapshot;
+#[cfg(test)]
+mod test_support;
+
+pub use database::{Database, Options, Transaction};
+
+pub use error::{Error, Result};
+pub use model::{
+    DataType, Entity, EntityId, Event, EventKind, Field, Fields, Schema, Table, TableId, Value,
+};
 
 /// The version shared by all EveDB workspace packages.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

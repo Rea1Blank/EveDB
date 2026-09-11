@@ -11,8 +11,11 @@ minimal configuration.
 Read the [product description](docs/product.md) for the data model, operations,
 entity lifecycle, transactions, and history retention.
 
-**Implementation status:** scaffold only; the database features described above
-are not implemented yet.
+**Implementation status:** experimental local Rust storage engine with typed
+tables, atomic cross-table transactions, indexed current/history reads, replay,
+snapshots, retention, and WAL/checkpoint recovery. The server and network API
+remain future work. Disk formats are not stable or production-qualified. See the
+[storage design and limits](docs/storage.md).
 
 ## Quick start
 
@@ -23,15 +26,22 @@ git clone https://github.com/Rea1Blank/EveDB.git
 cd EveDB
 cargo run --locked -p evedb-cli -- --help
 cargo run --locked -p evedb-cli -- --version
+cargo run --locked -p evedb-core --example lifecycle -- .local/lifecycle
+cargo run --locked -p evedb-cli -- inspect .local/lifecycle
+cargo run --locked -p evedb-cli -- checkpoint .local/lifecycle
 ```
 
 `rust-toolchain.toml` pins the development toolchain, including rustfmt and Clippy.
+The lifecycle example requires an unused directory and demonstrates transactions,
+historical reads, reopening, retention, and deletion. Use `evedb init <directory>`
+to initialize an empty database. `inspect` takes the database lock and performs
+normal recovery before displaying the catalog.
 
 ## Workspace
 
 | Path | Purpose |
 | --- | --- |
-| `src/evedb-core` | Core library; future home of the database engine |
+| `src/evedb-core` | Local storage engine, integration tests, and runnable examples |
 | `src/evedb-cli` | `evedb` command-line executable |
 | `docs` | Architecture and development decisions |
 | `legal` | Contributor agreement and licensing guidance |
