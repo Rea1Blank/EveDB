@@ -5,6 +5,7 @@ use crate::{
     deadline::{self, Lease},
     error::corrupt,
     model::EntityData,
+    ordered_map::OrderedMap,
     resources::{Permit, Reservation, Resources},
     snapshot::Root,
     storage::{
@@ -25,10 +26,10 @@ use std::{
 pub(crate) struct ReadState {
     pub root: Arc<Root>,
     pub catalog: Arc<BTreeMap<TableId, Table>>,
-    pub overlay: BTreeMap<(TableId, u64), Arc<EntityData>>,
+    pub overlay: OrderedMap<(TableId, u64), Arc<EntityData>>,
     pub lsn: u64,
     pub resources: Arc<Resources>,
-    pub charges: Vec<Arc<Reservation>>,
+    pub charges: OrderedMap<u64, Arc<Reservation>>,
     pub pager: Arc<Pager>,
     pub _lock: Arc<DirectoryLock>,
     pub poisoned: Arc<AtomicBool>,

@@ -7,6 +7,7 @@ use crate::{
     deadline::{self, Lease},
     error::corrupt,
     model::*,
+    ordered_map::OrderedMap,
     reader::{DirectoryLock, ReadState, ReaderShared, SnapshotData},
     resources::{Permit, Reservation, Resources, check},
     snapshot::{self, Root, TableWriter},
@@ -213,9 +214,9 @@ impl Database {
             catalog: Arc::new(root.catalog.clone()),
             lsn: root.lsn,
             root: Arc::new(root),
-            overlay: BTreeMap::new(),
+            overlay: OrderedMap::new(),
             resources: Resources::new(options.limits.clone(), options.timeouts.clone())?,
-            charges: Vec::new(),
+            charges: OrderedMap::new(),
             pager: Arc::new(pager),
             _lock: Arc::new(lock),
             poisoned: Arc::new(AtomicBool::new(false)),
@@ -818,7 +819,7 @@ struct Staging {
     _pin: Option<Arc<SnapshotData>>,
     _permit: Option<Permit>,
     reservation: Reservation,
-    catalog: BTreeMap<TableId, Table>,
+    catalog: Arc<BTreeMap<TableId, Table>>,
     staged: BTreeMap<(TableId, u64), EntityData>,
     operations: Vec<Operation>,
     failed: bool,
@@ -842,7 +843,7 @@ impl Staging {
             reservation.grow(8)?;
         }
         Ok(Self {
-            catalog: (*base.catalog).clone(),
+            catalog: base.catalog.clone(),
             base,
             options,
             _pin: pin,
@@ -1001,7 +1002,7 @@ impl Staging {
     fn execute(&mut self, operation: &Operation) -> Result<()> {
         if let Operation::Table(table) = operation {
             validate_table_change(&self.catalog, table)?;
-            self.catalog.insert(table.id, table.clone());
+            Arc::make_mut(&mut self.catalog).insert(table.id, table.clone());
             return Ok(());
         }
         let (table_id, id) = operation.entity_key().unwrap();
@@ -1093,7 +1094,7 @@ pub(crate) struct Prepared {
     pub deadline: Option<std::time::Instant>,
     reservation: Reservation,
     pub base_sequence: u64,
-    catalog: BTreeMap<TableId, Table>,
+    catalog: Arc<BTreeMap<TableId, Table>>,
     staged: BTreeMap<(TableId, u64), EntityData>,
     operations: Vec<Operation>,
 }
@@ -1159,8 +1160,8 @@ impl Prepared {
     }
     fn publish(self, db: &mut Database, lsn: u64) {
         let state = Arc::make_mut(&mut db.state);
-        state.charges.push(Arc::new(self.reservation));
-        state.catalog = Arc::new(self.catalog);
+        state.charges.insert(lsn, Arc::new(self.reservation));
+        state.catalog = self.catalog;
         state.overlay.extend(
             self.staged
                 .into_iter()
