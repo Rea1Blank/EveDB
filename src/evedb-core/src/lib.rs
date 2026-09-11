@@ -13,11 +13,13 @@ mod codec;
 mod database;
 mod error;
 mod model;
+mod reader;
 mod snapshot;
 #[cfg(test)]
 mod test_support;
 
 pub use database::{Database, Options, Transaction};
+pub use reader::{ReadSnapshot, Reader, SnapshotStats};
 
 pub use error::{Error, Result};
 pub use model::{

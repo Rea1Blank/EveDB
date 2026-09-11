@@ -69,6 +69,14 @@ pub(crate) struct Root {
     pub occupancy: BTreeMap<(TableId, u8), Occupancy>,
 }
 impl Root {
+    pub fn file_sizes(&self) -> impl Iterator<Item = (FileId, u64)> + '_ {
+        self.files.iter().map(|file| {
+            (
+                FileId::new(file.table, file.generation, file.kind, file.segment),
+                file.size,
+            )
+        })
+    }
     pub fn empty() -> Self {
         Self {
             generation: 0,
