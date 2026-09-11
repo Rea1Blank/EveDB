@@ -14,6 +14,7 @@ mod database;
 mod deadline;
 mod error;
 mod model;
+mod ordered_map;
 mod reader;
 mod resources;
 mod shared;

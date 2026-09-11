@@ -62,3 +62,17 @@ operation is unnecessary. Existing event payloads and acceleration snapshots kee
 their allocations across subsequent writes. The current row may still be copied
 for validation; initial loading of disk history is removed in the independent
 history stage. The WAL and published format are unchanged in this stage.
+
+## Structurally shared overlay
+
+Published overlays and reservation ledgers use immutable balanced AVL nodes.
+Pinning clones the root pointer; inserting/replacing a key copies only its search
+path and balancing nodes. Older views retain their nodes and entity references.
+Ordered range scans use a bounded traversal stack. Randomized model comparisons
+check updates, all bound types, old roots and balance invariants; a clone-count
+test guards against accidentally copying the entire map on publication.
+
+Transactions share the catalog until a schema operation changes it. Ordinary
+data transactions no longer clone every table definition at begin/commit. The
+checkpoint format is unchanged; persistent here means immutable shared memory
+versions, not an additional on-disk tree format.
