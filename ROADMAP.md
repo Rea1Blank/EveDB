@@ -1,163 +1,131 @@
-# Roadmap
+# Production roadmap
 
-This file records where the engine stands, the architectural decisions taken so
-far, and what each of them costs to reverse. It is a direction and a set of
-commitments, not a schedule or a promise of dates.
+EveDB is intended to become a production database for concurrent clients and
+sustained high request rates. Production readiness is a release gate, not a
+description of the current experimental engine. This plan replaces the earlier
+decision to defer multiple writers until benchmarks justify them.
 
-The guiding constraint is stated once here, because most decisions below follow
-from it: EveDB should not have to be redesigned to serve many concurrent
-clients. Work that is cheap now and expensive later is done now. Work that can
-be added without changing stored formats or user-visible interfaces is deferred
-until a measured need justifies it.
+## Review of the existing plans
 
-## Where we are
+Reviewed: README.md, docs/product.md, docs/architecture.md, docs/storage.md,
+docs/storage-pages.md, docs/storage-benchmarks.md, and the original roadmap
+against the implementation and its tests.
 
-A single-owner local storage engine written in Rust against the standard
-library. One handle owns a data directory through an OS file lock. Transactions
-exclusively borrow that handle, stage their changes privately, synchronize one
-complete WAL frame, and publish. Reads combine an in-memory overlay of recent
-changes with immutable checkpoint files. Checkpoints write only the entities a
-transaction touched, leave the rest in the generations that already hold them,
-and collect generations that have lost density.
-
-There is no server, no network protocol, and no concurrency: every read and
-write runs on one thread through one exclusive handle. The
-[storage document](docs/storage.md) describes the implemented design and its
-limits; [architecture](docs/architecture.md) describes the module boundaries.
-
-## Decisions
-
-### Cross-entity transactions stay
-
-A transaction may span entities and tables, and commits them atomically. The
-alternative — narrowing a transaction to one entity — would let the database be
-partitioned into independent single-writer shards, which is the cheaper route to
-parallel writes. It was considered and rejected: it moves a real limitation onto
-every application that needs a consistency boundary wider than one entity.
-
-The cost of keeping it is that parallel writes have to be earned the way
-PostgreSQL earns them, through concurrent insertion into one ordered log rather
-than through partitioning.
-
-Reversing this decision later is possible but expensive for users, not for us:
-it removes a guarantee applications will have been written against.
-
-### Concurrency arrives in two steps, readers first
-
-Many readers with one writer comes first; concurrent writers come later, if
-measurements justify them. This matches how SQLite in WAL mode and LMDB are
-built, and it is the step that turns read throughput from one core into as many
-cores as the machine has.
-
-Deferring concurrent writers is safe because the transition relaxes interfaces
-rather than tightening them. `Transaction` currently borrows the database
-mutably; moving to a shared borrow later does not break calling code.
-
-### Visibility goes through one predicate
-
-Every read decides what it can see by calling one function on its snapshot,
-never by comparing sequence numbers directly. Today that function answers
-whether a sequence number is at or below the snapshot's watermark. When several
-writers commit out of order, it will also consult the set of transactions still
-in flight, the way PostgreSQL consults its snapshot's in-progress list.
-
-This is the clearest example of cheap now and expensive later. Funnelling
-visibility through one predicate costs an indirection today. Retrofitting it
-means revisiting every read path.
-
-The WAL already serves as the commit record: a frame exists only for a
-transaction that committed, so no separate status log is needed.
-
-### Reads live on their own handle
-
-The read API belongs to a cloneable handle that is safe to send between threads,
-not to the writer. What that handle does internally is free to stay simple, and
-at first it will be. What matters is that application code is written against a
-type that already admits concurrent use.
-
-Keeping reads on the writing handle would be the one genuine trap in this
-design: every consumer would have to change when concurrency arrives.
-
-### Storage evolves toward run-routed indexes
-
-Published generations are immutable and a generation behaves like a sorted run;
-the collector that rewrites sparse generations behaves like a compactor. The
-remaining step is to route reads to per-generation indexes instead of rebuilding
-one global primary index at every checkpoint, and to move compaction into the
-background.
-
-The alternative is a mutable B+tree over a buffer pool with page-level logging,
-which is what PostgreSQL and InnoDB use. It has better read amplification and
-would be a rewrite of the storage layer, including page latching and torn-page
-protection. The current design reaches a similar outcome by evolution, so it is
-preferred until a measurement says otherwise.
-
-Nothing in the published format blocks this: history and snapshot indexes are
-already per generation, and only the primary index is global.
-
-## Next
-
-Readers that do not corner us. Four items, in one piece of work:
-
-1. A reader handle that is cloneable and safe to send between threads, carrying
-   the whole read API.
-2. Read state behind shared ownership — manifest, catalog and overlay reached
-   through a snapshot the reader holds, rather than borrowed from the writer.
-3. One visibility predicate, with a watermark in the snapshot from the start and
-   the in-flight set left as an empty placeholder.
-4. Retention of generations referenced by live snapshots. This is not future
-   work: a reader holding a manifest must not have its files deleted underneath
-   it, and on Windows an open file cannot be deleted at all. Reclamation already
-   works from the set of files live manifests reference, so this adds a term to
-   that set.
-
-Two levels of read isolation follow from the same mechanism, and the level is
-expressed by the handle rather than by a parameter. A reader takes the newest
-published snapshot for the duration of each call, which keeps a single operation
-internally consistent. Pinning a reader fixes its snapshot across calls, which
-gives repeatable, phantom-free reads — a serializable read-only transaction,
-since the write history is serial. A pinned snapshot also holds generations on
-disk, so that cost must be visible in the engine's reported statistics.
-
-## Deferred, and why that is safe
-
-| Deferred | Why it stays cheap to add |
+| Decision | Disposition and reason |
 | --- | --- |
-| Writer threads | Moving `Transaction` from a mutable to a shared borrow relaxes an interface; calling code is unaffected |
-| Group commit | Frame format is unchanged; only who calls `sync_all`, and when, changes |
-| Conflict detection | The unit already exists — an entity's version — so a check at commit time suffices, with no predicate locks |
-| Recovery of out-of-order frames | Each frame carries its own sequence number, so the rule changes from "strictly the next" to "the complete prefix" without touching bytes |
-| Sharding the page cache | Entirely inside the pager: no stored format, no public interface |
-| Per-generation index routing and background compaction | Immutable generations and a working collector are already in place |
+| Typed entities, history, retention, atomic cross-table writes | Keep: these define the product and its consistency boundary. |
+| Immutable files, checksums, incremental collection | Keep and evolve; a buffer-pool/B+tree rewrite is not justified by current evidence. |
+| Shared readers and retained snapshot generations | Required now; lifetimes include the directory lock, catalog, overlay, pager, and history files. |
+| Multiple writers only if measurements justify them | Reject: independently staged writers are required now. Serialize commit ordering initially, not client transaction lifetimes. |
+| Changing a mutable borrow later makes concurrency cheap | Reject: conflict detection, catalog changes, retention, publication, reclamation, and shared failures need contracts now. |
+| Entity version alone suffices for conflicts | Reject: retention and explicit snapshots do not advance it. Serializable also needs read and predicate validation. |
+| Snapshot reads are always serializable | Reject with concurrent writers: snapshot isolation allows write skew. Advertise the actual level. |
+| Empty in-flight set as future MVCC machinery | Defer: private staging and ordered publication need a committed watermark. Add status tracking with a protocol that uses it. |
+| Out-of-order WAL recovery is a local rule change | Reject: it needs a durable-prefix and hole protocol. Keep ordered recovery initially. |
+| One fsync per transaction | Temporary only. Group commit is required before write-throughput qualification; acknowledge only after durable sync. |
+| Run-routed indexes and background maintenance | Required throughput work; bound read amplification and maintenance debt. |
+| No compatibility or production qualification promised | Valid current status, unacceptable final target. Define upgrades, restore, and qualification before release. |
+| Standard-library-only implementation | Current fact, not a product constraint. Evaluate dependencies for TLS, protocols, runtime, and testing. |
+| Distributed sharding, SQL planner, columnar analytics, advanced SSI | Defer until single-node gates pass. Preserve interfaces where cheap without claiming capabilities. |
 
-## Known ceilings
+## Transaction architecture
 
-These are the reasons the engine cannot serve a large workload today. They are
-listed so that no benchmark is mistaken for a verdict on the design, and so the
-order of future work stays honest.
+One process owns a directory. Cloneable in-process connections will map to
+separate network sessions when the server is added. An idle transaction must not
+lock out other clients. Transactions stage privately and read their own writes.
+Commit validates dependencies, assigns the next sequence, writes a complete WAL
+batch, synchronizes, and publishes one coherent view. Cross-table state and
+events become visible together.
 
-1. Applying one event loads the entity's whole retained history into memory. The
-   cost of a write grows with the length of that history, while a writer needs
-   only the current state and version.
-2. A checkpoint rebuilds the primary index over every live entity. Checkpoint
-   frequency grows with the write rate and this cost grows with the database, so
-   the two multiply.
-3. Every transaction synchronizes its own WAL frame, which bounds commits to
-   what one synchronization stream can do.
-4. Reads run on one thread, and the page cache serializes every page access
-   through one lock.
+Use explicit transaction options: ReadCommitted, Snapshot, and Serializable.
+Initially implement Snapshot and reject unsupported levels with a typed error,
+without silently weakening the request. ReadCommitted will acquire a new
+committed view per operation. Snapshot pins one view for the transaction.
+Serializable requires read/absence/range dependencies or SSI, including mixed
+isolation interactions; same-key write conflicts do not implement it.
 
-Item 4 is what the next piece of work addresses. Items 1 through 3 are bounded,
-local changes that do not require a redesign.
+Snapshot writers validate every touched entity with first-committer-wins,
+including absent IDs, tombstones, retention, and acceleration snapshots.
+Catalog changes conflict conservatively with transactions using an older
+catalog. An aborted operation cannot commit. Conflicts mean retry the entire
+transaction. Uncertain I/O outcomes require recovery and outcome resolution
+before retry. A shared recovery-required state stops other connections too.
 
-## Not promised
+Snapshots own immutable read state, pin referenced files, and retain the OS
+directory lock. Cleanup uses the union of current, recovery, and live snapshot
+files. Report count, oldest sequence, and retained bytes. Initial copy-on-write
+maps are a bridge, not the final memory/throughput design.
 
-Parity with a mature general-purpose database. The work above removes
-architectural ceilings, which makes a comparison meaningful; it does not supply
-a query planner, statistics, parallel plans, or decades of tuning.
+The commit coordinator is an internal boundary: group synchronization, parallel
+preparation, and eventual pipelined publication preserve the API and recovery
+rules. No network session owns its mutex across client calls. Background
+checkpoints capture a committed frontier, write outside coordination, and
+publish without losing newer changes. Reclamation must eventually account for
+backup and replication consumers. Event retention and snapshot retention are
+different policies.
 
-Stable on-disk formats, a migration path between them, or production
-qualification. Power-loss behaviour in particular is not qualified.
+## Implementation sequence
 
-Partitioning the database into independent shards, which was considered and
-rejected above.
+Each numbered step gets its own branch and PR with tests and documentation.
+Merge only the reviewed head after required checks pass. The first delivery is
+steps 1–3; subsequent steps are release requirements, not a claim that the first
+delivery qualifies for production.
+
+| Step | Deliverable | Acceptance gate |
+| --- | --- | --- |
+| 1 | Product requirements and architectural contracts | Deferred capabilities and current limitations are explicit. |
+| 2 | Cloneable readers, pinned snapshots, file/lock lifetimes | Consistent reads through writes, retention, compaction, and writer drop; later reclamation after snapshots drop. |
+| 3 | Cloneable connections, independently staged writers, isolation options, conflicts | Synchronized clients stage simultaneously; disjoint writes commit; same/absent-key, catalog, and retention conflicts abort atomically; reopen preserves winners. |
+| 4 | Bounded admission and concurrent workload harness | Bound active transactions, staging bytes, snapshot age/bytes, responses, and queue depth; overload/deadline errors; RPS and latency distributions. |
+| 5 | Group commit and coordinator failure tests | Share sync; preserve acknowledged commits on restart; poison affected requests on faults; bound queue count/bytes/delay. |
+| 6 | Current-state writes independent of history; scalable versioned overlays | Update cost independent of retained history; no copying all recent keys at snapshot/commit; bounded memory. |
+| 7 | Per-run routing, background checkpoint/compaction, cache contention | Stable maintenance debt and p99 under churn, bounded amplification, restart-safe maintenance. |
+| 8 | ReadCommitted, then Serializable in separate PRs | Isolation histories, phantom/absence/write-skew tests, DDL interactions, randomized model checks. |
+| 9 | Server/protocol, split into transport/session/security PRs | Concurrent remote clients; bounds, cancellation, deadlines, transaction cleanup, auth, authorization, TLS, idempotency/outcome resolution, graceful drain, metrics. |
+| 10 | Durability, compatibility, backup/restore, split by capability | Platform durability contract, storage fault matrix, crash/power-loss qualification, verified restore, upgrades, corruption diagnostics, disk-full handling. |
+| 11 | Qualification and release | Sustained load/failure gates below pass on declared platforms; publish reproducible results and runbooks. |
+
+## Performance and release gates
+
+An RPS number without workload, hardware, durability, and latency is not a target.
+Start with 1/8/32/128 clients, 1 KiB and 16 KiB random/compressible payloads,
+100/0, 95/5, 50/50, and 0/100 read/write mixes, uniform/hot keys, single-operation
+and cross-table batches, and short/long history. Include warm/cold and
+larger-than-RAM datasets with an enforced memory budget. Record machine,
+storage, filesystem, build, and options.
+
+Before throughput work, measure a baseline and commit a hardware-specific SLO
+profile with numeric RPS, p95/p99 latency, error budget, and recovery-time targets.
+Use open-loop arrivals as well as saturation tests; report queue time, conflicts,
+retries, rejections, durable commits, and successful operations separately.
+Single-run totals and batched event counts do not establish network RPS or
+durable transactions per second.
+
+Release evidence must include:
+
+- No lost acknowledged commits, partial transactions, dirty reads, lost updates,
+  or reclamation under live snapshots in tested schedules.
+- WAL/publication/compaction/backup/restore fault coverage. Process termination
+  is not power loss. Windows directory sync is currently a no-op and needs a
+  platform-specific resolution before durability qualification.
+- Bounded memory, descriptors, WAL, snapshot retention, queues, and compaction
+  debt under sustained overload, with explicit backpressure and timeouts.
+- At least 24 hours of mixed load and overload/recovery trials with maintenance
+  enabled, meeting the recorded SLO profile without hidden retries.
+- Verified restore and recovery time on production-sized data; documented
+  upgrade/downgrade support, format rejection, and supported platforms.
+- Metrics for latency, durable lag, conflicts, queues, memory, snapshots, cache,
+  WAL, maintenance, recovery; actionable operating procedures.
+
+Replication/HA is a separate release scope. The first qualified release may be
+single-node with that availability limit documented; backup remains mandatory.
+Existing unit and subprocess tests alone cannot qualify production readiness.
+
+## Design references
+
+These support the isolation/WAL distinctions; EveDB's architecture is our choice.
+
+- [PostgreSQL isolation](https://www.postgresql.org/docs/18/transaction-iso.html): snapshot isolation and serialization anomalies.
+- [SET TRANSACTION](https://www.postgresql.org/docs/18/sql-set-transaction.html): explicit levels and per-command snapshots.
+- [RocksDB WAL performance](https://github.com/facebook/rocksdb/wiki/WAL-Performance): sharing synchronization.
+- [RocksDB unordered writes](https://github.com/facebook/rocksdb/wiki/unordered_write): publication and snapshot protocols.
