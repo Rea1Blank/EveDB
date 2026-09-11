@@ -290,6 +290,9 @@ impl Database {
         Ok(db)
     }
 
+    pub(crate) fn checkpoint_generation(&self) -> u64 {
+        self.state.root.generation
+    }
     pub(crate) fn ready(&self) -> Result<()> {
         if self.state.poisoned.load(Ordering::Acquire) {
             Err(Error::NeedsRecovery)

@@ -151,3 +151,9 @@ These changes remove major write amplification paths; they do not establish a
 production RPS claim. External metrics, load qualification, background maintenance,
 network serving, additional isolation levels, backup/upgrades and platform
 power-loss qualification remain the subsequent roadmap work.
+
+Conflict revisions are pruned after automatic checkpoints as well as explicit
+checkpoint/compaction calls, after durable commit bookkeeping is installed. The
+oldest live snapshot remains the conservative pruning boundary. A regression test
+holds a stale writer through automatic checkpoints, verifies its conflict, then
+checks that revisions stop accumulating after the writer releases its pin.
