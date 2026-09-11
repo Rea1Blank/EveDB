@@ -7,7 +7,7 @@ use crate::{
     deadline::{self, Lease},
     error::corrupt,
     model::*,
-    reader::{ReadState, ReaderShared, SnapshotData},
+    reader::{DirectoryLock, ReadState, ReaderShared, SnapshotData},
     resources::{Permit, Reservation, Resources, check},
     snapshot::{self, Root, TableWriter},
     storage::{
@@ -153,6 +153,7 @@ impl Database {
             .truncate(false)
             .open(directory.join("LOCK"))?;
         lock.try_lock().map_err(|_| Error::Locked)?;
+        let lock = DirectoryLock(lock);
         if !directory.join("control").exists() {
             initialize(&directory)?;
         }
@@ -1414,4 +1415,26 @@ fn io_fault(name: &str) -> std::io::Result<()> {
     #[cfg(not(feature = "fault-injection"))]
     let _ = name;
     Ok(())
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn last_owner_unlocks_even_while_a_duplicate_descriptor_exists() {
+        let dir = TempDir::new();
+        let db = Database::open(&dir.0).unwrap();
+        let descriptor = db.state._lock.0.try_clone().unwrap();
+        let snapshot = db.reader().pin().unwrap();
+        drop(db);
+        assert!(matches!(Database::open(&dir.0), Err(Error::Locked)));
+        drop(snapshot);
+        let reopened = Database::open(&dir.0).unwrap();
+        drop(descriptor);
+        assert!(matches!(Database::open(&dir.0), Err(Error::Locked)));
+        drop(reopened);
+        Database::open(&dir.0).unwrap();
+    }
 }
