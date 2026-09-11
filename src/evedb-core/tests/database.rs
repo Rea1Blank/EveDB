@@ -364,12 +364,22 @@ fn repeated_checkpoints_reclaim_old_generations_without_losing_inactive_entities
         db.checkpoint().unwrap();
     }
     assert_eq!(fs::read_dir(dir.0.join("wal")).unwrap().count(), 2);
-    assert_eq!(
+    let directories = || {
         fs::read_dir(dir.0.join("tables/00000000000000000001"))
             .unwrap()
-            .count(),
-        2
-    );
+            .count()
+    };
+    // Entity 2 was never touched, so it still lives where it was first written
+    // and its generation is still referenced.
+    let first = db.generations()[0];
+    assert_eq!((first.entities, first.dead), (2, 1));
+    assert!(directories() <= Options::default().max_generations + 1);
+    // Collecting everything leaves one generation, plus the retained baseline
+    // until a second pass replaces that too.
+    db.compact().unwrap();
+    assert_eq!(db.generations().len(), 1);
+    db.compact().unwrap();
+    assert_eq!(directories(), 2);
     drop(db);
     let db = Database::open(&dir.0).unwrap();
     assert_eq!(
@@ -377,6 +387,248 @@ fn repeated_checkpoints_reclaim_old_generations_without_losing_inactive_entities
         Value::Int64(20)
     );
     assert_eq!(db.retained_range(table, 1).unwrap(), (3, 4));
+}
+
+#[test]
+fn damage_to_a_shared_file_is_reported_rather_than_recovered() {
+    let dir = TestDir::new();
+    let mut db = Database::open(&dir.0).unwrap();
+    let table = db.create_table("items", schema()).unwrap();
+    db.create(table, 1, fields(1)).unwrap();
+    db.create(table, 2, fields(2)).unwrap();
+    db.checkpoint().unwrap();
+    let shared = db.generations()[0].generation;
+    db.apply(table, 1, fields(3)).unwrap();
+    db.checkpoint().unwrap();
+    // Entity 2 never moved, so both the published and the retained manifest read
+    // it from the same file. Sharing files is what makes a checkpoint cheap; it
+    // also means the retained checkpoint is no longer an independent copy.
+    assert!(db.generations().iter().any(|e| e.generation == shared));
+    drop(db);
+    flip(
+        &dir.0
+            .join("tables/00000000000000000001")
+            .join(format!("{shared:020}"))
+            .join("current.pages"),
+        8191,
+    );
+    assert!(matches!(Database::open(&dir.0), Err(Error::Corrupt(_))));
+}
+
+#[test]
+fn an_untouched_entity_is_not_rewritten_by_a_checkpoint() {
+    let dir = TestDir::new();
+    let mut db = Database::open(&dir.0).unwrap();
+    let table = db.create_table("items", schema()).unwrap();
+    for id in 1..=4 {
+        db.create(table, id, fields(id as i64)).unwrap();
+    }
+    db.checkpoint().unwrap();
+    let original = db.generations()[0].generation;
+    db.apply(table, 1, fields(100)).unwrap();
+    db.checkpoint().unwrap();
+    let generations = db.generations();
+    assert_eq!(generations.len(), 2);
+    // The first generation kept all four records and lost one to the rewrite.
+    assert_eq!(generations[0].generation, original);
+    assert_eq!((generations[0].entities, generations[0].dead), (4, 1));
+    // The new generation holds only the entity the transaction touched.
+    assert_eq!((generations[1].entities, generations[1].dead), (1, 0));
+    assert_eq!(
+        db.get(table, 4).unwrap().unwrap().fields[&1],
+        Value::Int64(4)
+    );
+    assert_eq!(
+        db.get(table, 1).unwrap().unwrap().fields[&1],
+        Value::Int64(100)
+    );
+}
+
+#[test]
+fn a_generation_is_collected_once_it_loses_density() {
+    let dir = TestDir::new();
+    let mut db = Database::open(&dir.0).unwrap();
+    let table = db.create_table("items", schema()).unwrap();
+    for id in 1..=4 {
+        db.create(table, id, fields(id as i64)).unwrap();
+    }
+    db.checkpoint().unwrap();
+    let original = db.generations()[0].generation;
+    // Three of four entities move away, which drops the generation below half.
+    for id in 1..=3 {
+        db.apply(table, id, fields(100 + id as i64)).unwrap();
+        db.checkpoint().unwrap();
+    }
+    // The policy reads the published manifest, so the generation that just lost
+    // its third entity is collected by the checkpoint that follows.
+    assert!(
+        db.generations()
+            .iter()
+            .any(|entry| entry.generation == original)
+    );
+    db.checkpoint().unwrap();
+    assert!(
+        db.generations()
+            .iter()
+            .all(|entry| entry.generation != original),
+        "a generation holding one live entity out of four must be collected"
+    );
+    for id in 1..=4 {
+        let expected = if id <= 3 { 100 + id } else { id };
+        assert_eq!(
+            db.get(table, id as u64).unwrap().unwrap().fields[&1],
+            Value::Int64(expected)
+        );
+    }
+}
+
+#[test]
+fn collection_is_spread_over_checkpoints_when_it_exceeds_its_budget() {
+    let dir = TestDir::new();
+    let mut db = Database::open_with_options(
+        &dir.0,
+        Options {
+            // Mark the first generation for collection as soon as it loses one
+            // entity, then let only two entities move per checkpoint.
+            compact_live_ratio: 0.9,
+            collect_entities: 2,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let table = db.create_table("items", schema()).unwrap();
+    for id in 1..=7 {
+        db.create(table, id, fields(id as i64)).unwrap();
+    }
+    db.checkpoint().unwrap();
+    let draining = db.generations()[0].generation;
+    db.apply(table, 1, fields(100)).unwrap();
+    let live = |db: &Database| {
+        db.generations()
+            .iter()
+            .find(|entry| entry.generation == draining)
+            .map(|entry| entry.entities - entry.dead)
+    };
+    // The first checkpoint publishes the rewritten entity, which is what marks
+    // the generation for collection; the remaining six then move two at a time.
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        db.checkpoint().unwrap();
+        seen.push(live(&db));
+    }
+    assert_eq!(seen, [Some(6), Some(4), Some(2), None]);
+    for id in 1..=7 {
+        let expected = if id == 1 { 100 } else { id };
+        assert_eq!(
+            db.get(table, id as u64).unwrap().unwrap().fields[&1],
+            Value::Int64(expected)
+        );
+    }
+}
+
+#[test]
+fn churn_keeps_every_entity_readable_and_the_database_bounded() {
+    let dir = TestDir::new();
+    let mut db = Database::open(&dir.0).unwrap();
+    let table = db.create_table("items", schema()).unwrap();
+    let entities = 200u64;
+    db.write(|tx| {
+        for id in 1..=entities {
+            tx.create(table, id, fields(0))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.compact().unwrap();
+    db.compact().unwrap();
+    let mut expected = vec![0i64; entities as usize + 1];
+    let mut random = 12345u64;
+    let mut halfway = 0;
+    for round in 1..=80i64 {
+        for _ in 0..20 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let id = random % entities + 1;
+            db.apply(table, id, fields(round)).unwrap();
+            expected[id as usize] = round;
+        }
+        db.checkpoint().unwrap();
+        assert!(db.generations().len() <= Options::default().max_generations);
+        if round == 40 {
+            halfway = size(&dir.0);
+        }
+    }
+    // Every entity reads back, whichever generation now holds it.
+    for id in 1..=entities {
+        assert_eq!(
+            db.get(table, id).unwrap().unwrap().fields[&1],
+            Value::Int64(expected[id as usize])
+        );
+    }
+    // Superseded records are reclaimed as generations are collected, so churn
+    // settles instead of growing with the number of checkpoints. The steady
+    // state is larger than a compacted database: it carries the superseded
+    // records a collection has not reached yet, and every referenced generation
+    // costs at least a few pages per table.
+    let churned = size(&dir.0);
+    assert!(
+        churned < halfway * 3 / 2,
+        "{churned} bytes after 80 rounds against {halfway} after 40"
+    );
+    drop(db);
+    let mut db = Database::open(&dir.0).unwrap();
+    db.compact().unwrap();
+    db.compact().unwrap();
+    assert_eq!(db.generations().len(), 1);
+    // A full pass reclaims what the bounded collections had not reached.
+    assert!(size(&dir.0) < churned);
+    for id in 1..=entities {
+        assert_eq!(
+            db.get(table, id).unwrap().unwrap().fields[&1],
+            Value::Int64(expected[id as usize])
+        );
+    }
+}
+
+fn size(path: &std::path::Path) -> u64 {
+    let mut total = 0;
+    for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        total += if entry.file_type().unwrap().is_dir() {
+            size(&entry.path())
+        } else {
+            entry.metadata().unwrap().len()
+        };
+    }
+    total
+}
+
+#[test]
+fn the_generation_budget_bounds_a_manifest() {
+    let dir = TestDir::new();
+    let mut db = Database::open_with_options(
+        &dir.0,
+        Options {
+            // Keep every generation dense so only the budget can collect one.
+            compact_live_ratio: 0.0,
+            max_generations: 3,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let table = db.create_table("items", schema()).unwrap();
+    for id in 1..=20 {
+        db.create(table, id, fields(id as i64)).unwrap();
+        db.checkpoint().unwrap();
+        assert!(db.generations().len() <= 3);
+    }
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    for id in 1..=20 {
+        assert_eq!(
+            db.get(table, id).unwrap().unwrap().fields[&1],
+            Value::Int64(id as i64)
+        );
+    }
 }
 
 #[test]

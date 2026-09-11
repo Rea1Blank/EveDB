@@ -24,32 +24,45 @@ quiet local machine; it indicates where to look, and it does not block a merge.
 
 ## Recorded runs
 
-Two local Windows x64 runs, Rust `1.98.1-x86_64-pc-windows-gnu`, optimized
+Three local Windows x64 runs, Rust `1.98.1-x86_64-pc-windows-gnu`, optimized
 release build, no third-party crates. The first column is the original
 measurement; the second is the same workload after checkpoint pages gained a
 bounded cache, index nodes gained binary search, and ordered scans stopped
-descending the tree twice per row. Both are single runs on one machine.
+descending the tree twice per row; the third is after checkpoints became
+incremental and started collecting generations. Each is a single run on one
+machine, in a separate session.
 
-| Operation | First | With the page cache |
-| --- | ---: | ---: |
-| Create 10,000 entities, including automatic checkpoint work | 1,360.427 ms | 731.138 ms |
-| Explicit checkpoint after creation | 9,070.136 ms | 874.448 ms |
-| Reopen and verify checkpoint files | 77.751 ms | 82.975 ms |
-| 1,000 deterministic pseudorandom current reads | 414.378 ms | 30.781 ms |
-| Apply 300 events in one committed transaction | 9.508 ms | 9.984 ms |
-| 100 indexed historical reads | 163.198 ms | 12.840 ms |
-| 100 full replays from the retained base | 749.397 ms | 292.505 ms |
-| Scan all 10,000 active entities | 4,327.973 ms | 58.621 ms |
-| Retention and two full checkpoints | 22,934.397 ms | 1,809.103 ms |
+| Operation | First | With the page cache | Incremental |
+| --- | ---: | ---: | ---: |
+| Create 10,000 entities, including automatic checkpoint work | 1,360.427 ms | 731.138 ms | 721.012 ms |
+| Explicit checkpoint after creation | 9,070.136 ms | 874.448 ms | 189.750 ms |
+| Reopen and verify checkpoint files | 77.751 ms | 82.975 ms | 75.932 ms |
+| 1,000 deterministic pseudorandom current reads | 414.378 ms | 30.781 ms | 29.822 ms |
+| Apply 300 events in one committed transaction | 9.508 ms | 9.984 ms | 8.453 ms |
+| 100 indexed historical reads | 163.198 ms | 12.840 ms | 11.691 ms |
+| 100 full replays from the retained base | 749.397 ms | 292.505 ms | 265.558 ms |
+| Scan all 10,000 active entities | 4,327.973 ms | 58.621 ms | 32.925 ms |
+| Retention and two full checkpoints | 22,934.397 ms | 1,809.103 ms | 63.205 ms |
 
-Directory size was 47,632,445 bytes before retention and 47,565,864 bytes after
-retention and two checkpoints, identical in both runs: the cache changed how
-pages are read, not what is written. This includes two recovery generations; it
-is not the size of one logical snapshot. Removing 290 small events from one
-entity saves little space beside the unchanged 10,000 current/base records.
+Directory size was 47,632,445 bytes before retention and 47,565,864 after it in
+the first two runs, and 24,270,891 before and 24,319,042 after in the third. The
+cache changed how pages are read, not what is written; sharing files between
+generations changed what is written. Roughly half the earlier figure was the
+retained recovery generation holding a second full copy of records identical to
+the published ones. Removing 290 small events from one entity still saves little
+space beside the unchanged 10,000 current/base records, and now leaves them in
+place until a collection rewrites that generation.
+
+The explicit checkpoint after creation improved because it no longer copies the
+records it just wrote; what remains is rebuilding the primary index over all
+10,000 entities. Retention with two checkpoints improved the most, from seconds
+to milliseconds, because those checkpoints touch one entity instead of the
+database. Reads are unchanged, as expected: the primary index still names each
+entity's generation directly, so a point read costs one descent regardless of how
+many generations a manifest references.
 
 Reopening did not improve, which is expected: startup still streams every
-checkpoint file to verify its whole-file checksum, and that cost is proportional
+referenced file to verify its whole-file checksum, and that cost is proportional
 to the database rather than to the number of files.
 
 ## Interpretation and next measurements
@@ -63,14 +76,20 @@ safety or performance for a database larger than physical RAM.
 Snapshot lookup reduces reconstruction work in this workload. Caching decoded
 pages removed the dominant cost of every read path, because the engine had been
 reopening and revalidating a file for each lookup; the remaining per-read cost is
-decoding a record into owned memory. Full-generation rewriting is still the
-dominant maintenance cost and still scales with the database rather than with the
-changed data, so the checkpoint figures above should not be read as write
-throughput.
+decoding a record into owned memory. Maintenance no longer scales with the whole
+database, but it has not become free: a checkpoint still rebuilds the primary
+index over every live entity, which is what the third column's 190 ms mostly is.
+
+This benchmark also does not exercise what incremental publication costs over
+time. It writes once, then touches one entity, so no generation ever loses enough
+density to be collected and the manifest never approaches its generation budget.
+A workload that repeatedly updates a changing subset would show the collector
+working, the residue of superseded records between collections, and the cost of a
+`compact` pass — none of which these numbers cover.
 
 This run does not compare engines, page sizes, clustered trees, LSM layouts, or
 compression algorithms. Future decisions need repeated cold/warm measurements,
 larger-than-RAM data under an enforced memory budget, histories of different
-lengths, compressible and random payloads, read/write mixtures, and checkpoint
-write amplification. Power-loss tests are separate from this benchmark and from
-the existing subprocess crash tests.
+lengths, compressible and random payloads, read/write mixtures, checkpoint write
+amplification, and update-heavy workloads that drive collection. Power-loss tests
+are separate from this benchmark and from the existing subprocess crash tests.
