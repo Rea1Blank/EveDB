@@ -30,6 +30,8 @@ use std::{
 /// Configuration for checkpointing and automatic history maintenance.
 #[derive(Clone, Debug)]
 pub struct Options {
+    /// Bounds and optional collection delay for shared WAL synchronization.
+    pub group_commit: crate::GroupCommit,
     /// Transaction, snapshot, operation and commit-admission deadlines.
     pub timeouts: crate::Timeouts,
     /// Admission and mutation retention budgets.
@@ -71,6 +73,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            group_commit: crate::GroupCommit::default(),
             limits: crate::Limits::default(),
             timeouts: crate::Timeouts::default(),
             checkpoint_bytes: 8 * 1024 * 1024,
@@ -110,6 +113,8 @@ pub struct GenerationStats {
 pub struct Database {
     directory: PathBuf,
     wal: File,
+    #[cfg(test)]
+    pub(crate) wal_syncs: usize,
     state: Arc<ReadState>,
     readers: Arc<ReaderShared>,
     next_generation: u64,
@@ -129,6 +134,7 @@ impl Database {
     pub fn open_with_options(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         options.limits.validate()?;
         options.timeouts.validate()?;
+        options.group_commit.validate()?;
         if options.checkpoint_bytes < 4096 || options.history_segment_bytes < 4096 {
             return Err(Error::Invalid(
                 "checkpoint and segment targets must be at least 4096 bytes".into(),
@@ -224,6 +230,8 @@ impl Database {
         let mut db = Self {
             directory,
             wal,
+            #[cfg(test)]
+            wal_syncs: 0,
             readers: Arc::new(ReaderShared::new(state.clone())),
             state,
             next_generation,
@@ -1110,55 +1118,112 @@ impl Prepared {
     pub fn is_empty(&self) -> bool {
         self.operations.is_empty()
     }
-    pub fn commit(mut self, db: &mut Database) -> Result<u64> {
-        db.ready()?;
-        deadline::check(self.deadline)?;
-        if self.operations.is_empty() {
-            return Ok(db.state.lsn);
-        }
-        if db.wal.metadata()?.len() >= db.options.checkpoint_bytes
-            && db.state.lsn > db.state.root.lsn
-        {
-            db.checkpoint()?;
-        }
-        let lsn = db
-            .state
-            .lsn
-            .checked_add(1)
-            .ok_or_else(|| Error::Invalid("transaction sequence exhausted".into()))?;
-        // Transaction start order is independent of commit order. Only newly
-        // staged events get the final sequence; retained committed events keep theirs.
-        for data in self.staged.values_mut() {
-            for event in &mut data.events {
-                if event.transaction > self.base_sequence {
-                    event.transaction = lsn;
+    pub fn bytes(&self) -> usize {
+        self.reservation.bytes
+    }
+    pub fn commit(self, db: &mut Database) -> Result<u64> {
+        Self::commit_group(vec![self], db).pop().unwrap()
+    }
+    pub fn commit_group(batches: Vec<Self>, db: &mut Database) -> Vec<Result<u64>> {
+        let mut results: Vec<Option<Result<u64>>> = (0..batches.len()).map(|_| None).collect();
+        let mut active: Vec<_> = batches.into_iter().enumerate().collect();
+        let preparation = (|| -> Result<Vec<Vec<u8>>> {
+            db.ready()?;
+            if db.wal.metadata()?.len() >= db.options.checkpoint_bytes
+                && db.state.lsn > db.state.root.lsn
+            {
+                db.checkpoint()?;
+            }
+            loop {
+                active.retain(|(index, batch)| {
+                    if deadline::check(batch.deadline).is_err() {
+                        results[*index] = Some(Err(Error::DeadlineExceeded));
+                        false
+                    } else if batch.is_empty() {
+                        results[*index] = Some(Ok(batch.base_sequence));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                let mut frames = Vec::with_capacity(active.len());
+                for (offset, (_, batch)) in active.iter_mut().enumerate() {
+                    let lsn =
+                        db.state.lsn.checked_add(offset as u64 + 1).ok_or_else(|| {
+                            Error::Invalid("transaction sequence exhausted".into())
+                        })?;
+                    for data in batch.staged.values_mut() {
+                        for event in &mut data.events {
+                            if event.transaction > batch.base_sequence {
+                                event.transaction = lsn;
+                            }
+                        }
+                    }
+                    frames.push(frame::encode(2, lsn, &encode_ops(&batch.operations))?);
+                }
+                if active
+                    .iter()
+                    .all(|(_, batch)| deadline::check(batch.deadline).is_ok())
+                {
+                    return Ok(frames);
                 }
             }
-        }
-        let encoded = frame::encode(2, lsn, &encode_ops(&self.operations))?;
-        deadline::check(self.deadline)?;
-        fault("wal-before-write");
-        let result = (|| -> std::io::Result<()> {
-            io_fault("before-write")?;
-            db.wal.write_all(&encoded[..encoded.len() / 2])?;
-            io_fault("partial-write")?;
-            fault("wal-partial");
-            db.wal.write_all(&encoded[encoded.len() / 2..])?;
-            io_fault("before-sync")?;
-            fault("wal-written");
-            db.wal.sync_all()?;
-            io_fault("after-sync")?;
-            fault("wal-synced");
-            Ok(())
         })();
-        if let Err(error) = result {
-            db.state.poisoned.store(true, Ordering::Release);
-            return Err(Error::CommitUnknown(error));
+        let frames = match preparation {
+            Ok(frames) => frames,
+            Err(error) => {
+                for (index, _) in active {
+                    results[index] = Some(Err(error.duplicate()));
+                }
+                return results.into_iter().map(Option::unwrap).collect();
+            }
+        };
+        if !frames.is_empty() {
+            fault("wal-before-write");
+            let write = (|| -> std::io::Result<()> {
+                io_fault("before-write")?;
+                for encoded in &frames {
+                    db.wal.write_all(&encoded[..encoded.len() / 2])?;
+                    io_fault("partial-write")?;
+                    fault("wal-partial");
+                    db.wal.write_all(&encoded[encoded.len() / 2..])?;
+                }
+                io_fault("before-sync")?;
+                fault("wal-written");
+                db.wal.sync_all()?;
+                #[cfg(test)]
+                {
+                    db.wal_syncs += 1;
+                }
+                io_fault("after-sync")?;
+                fault("wal-synced");
+                Ok(())
+            })();
+            if let Err(error) = write {
+                db.state.poisoned.store(true, Ordering::Release);
+                for (index, _) in active {
+                    results[index] = Some(Err(Error::CommitUnknown(std::io::Error::new(
+                        error.kind(),
+                        error.to_string(),
+                    ))));
+                }
+            } else {
+                let first = db.state.lsn;
+                for (offset, (index, batch)) in active.into_iter().enumerate() {
+                    let lsn = first + offset as u64 + 1;
+                    batch.publish_state(db, lsn);
+                    results[index] = Some(Ok(lsn));
+                }
+                db.readers.publish(db.state.clone());
+            }
         }
-        self.publish(db, lsn);
-        Ok(lsn)
+        results.into_iter().map(Option::unwrap).collect()
     }
     fn publish(self, db: &mut Database, lsn: u64) {
+        self.publish_state(db, lsn);
+        db.readers.publish(db.state.clone());
+    }
+    fn publish_state(self, db: &mut Database, lsn: u64) {
         let state = Arc::make_mut(&mut db.state);
         state.charges.insert(lsn, Arc::new(self.reservation));
         state.catalog = self.catalog;
@@ -1168,7 +1233,6 @@ impl Prepared {
                 .map(|(key, data)| (key, Arc::new(data))),
         );
         state.lsn = lsn;
-        db.readers.publish(db.state.clone());
     }
 }
 
