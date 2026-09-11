@@ -5,9 +5,10 @@ use crate::{
     codec::{Decoder, Encoder},
     error::corrupt,
     model::*,
+    reader::{ReadState, ReaderShared},
     snapshot::{self, Root, TableWriter},
     storage::{
-        frame, heap, index,
+        frame, heap,
         pager::{self, FileId, Pager},
     },
 };
@@ -16,6 +17,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 /// Configuration for checkpointing and automatic history maintenance.
@@ -85,24 +90,20 @@ pub struct GenerationStats {
 
 /// A single-owner local database that synchronizes the WAL before acknowledging writes.
 ///
-/// A transaction exclusively borrows this handle. To share it between threads,
-/// place it behind a mutex. An OS file lock excludes other handles/processes.
+/// A write transaction exclusively borrows this handle. Independent readers
+/// from [`reader`](Self::reader) do not borrow it and can run on other threads.
+/// An OS file lock excludes other owners/processes until all readers are dropped.
 /// Checkpointed records and indexes are read from disk on demand; recently
 /// changed entities reside in memory until the next checkpoint.
 /// Power-loss durability depends on filesystem synchronization guarantees;
 /// directory synchronization is currently implemented only on Unix.
 pub struct Database {
     directory: PathBuf,
-    pager: Pager,
-    _lock: File,
     wal: File,
-    root: Root,
-    catalog: BTreeMap<TableId, Table>,
-    overlay: BTreeMap<(TableId, u64), EntityData>,
-    lsn: u64,
+    state: Arc<ReadState>,
+    readers: Arc<ReaderShared>,
     next_generation: u64,
     options: Options,
-    poisoned: bool,
 }
 impl Database {
     /// Opens or initializes a database using default maintenance options.
@@ -196,22 +197,26 @@ impl Database {
             .last()
             .map_or(1, |(n, _)| n.saturating_add(1))
             .max(segments.last().unwrap().0.saturating_add(1));
+        let state = Arc::new(ReadState {
+            catalog: Arc::new(root.catalog.clone()),
+            lsn: root.lsn,
+            root: Arc::new(root),
+            overlay: BTreeMap::new(),
+            pager: Arc::new(pager),
+            _lock: Arc::new(lock),
+            poisoned: Arc::new(AtomicBool::new(false)),
+        });
         let mut db = Self {
             directory,
-            pager,
-            _lock: lock,
             wal,
-            catalog: root.catalog.clone(),
-            lsn: root.lsn,
-            root,
-            overlay: BTreeMap::new(),
+            readers: Arc::new(ReaderShared::new(state.clone())),
+            state,
             next_generation,
             options,
-            poisoned: false,
         };
         let mut active_end = 0;
         for (number, path) in segments {
-            if number < db.root.generation || number > active_generation {
+            if number < db.state.root.generation || number > active_generation {
                 continue;
             }
             let mut file = File::open(path)?;
@@ -226,8 +231,8 @@ impl Database {
                 if record.kind != 2 {
                     return Err(corrupt("unexpected record in transaction WAL"));
                 }
-                if record.lsn > db.root.lsn {
-                    if db.lsn.checked_add(1) != Some(record.lsn) {
+                if record.lsn > db.state.root.lsn {
+                    if db.state.lsn.checked_add(1) != Some(record.lsn) {
                         return Err(corrupt("gap or duplicate in transaction sequence"));
                     }
                     let mut tx = Transaction::new(&mut db);
@@ -255,7 +260,7 @@ impl Database {
     }
 
     fn ready(&self) -> Result<()> {
-        if self.poisoned {
+        if self.state.poisoned.load(Ordering::Acquire) {
             Err(Error::NeedsRecovery)
         } else {
             Ok(())
@@ -263,20 +268,22 @@ impl Database {
     }
     /// Returns the last committed transaction sequence number.
     pub fn sequence(&self) -> u64 {
-        self.lsn
+        self.state.lsn
     }
     /// Lists table definitions in stable ID order.
     pub fn tables(&self) -> impl Iterator<Item = &Table> {
-        self.catalog.values()
+        self.state.catalog.values()
     }
     /// Resolves a table by its current name.
     pub fn table(&self, name: &str) -> Option<&Table> {
-        self.catalog.values().find(|t| t.name == name)
+        self.state.catalog.values().find(|t| t.name == name)
     }
     /// Starts an isolated write transaction. Dropping it discards staged operations.
     pub fn transaction(&mut self) -> Result<Transaction<'_>> {
         self.ready()?;
-        if self.wal.metadata()?.len() >= self.options.checkpoint_bytes && self.lsn > self.root.lsn {
+        if self.wal.metadata()?.len() >= self.options.checkpoint_bytes
+            && self.state.lsn > self.state.root.lsn
+        {
             self.checkpoint()?;
         }
         Ok(Transaction::new(self))
@@ -307,161 +314,55 @@ impl Database {
     pub fn delete(&mut self, table: TableId, id: u64) -> Result<()> {
         self.write(|tx| tx.delete(table, id))
     }
-    /// Returns a live current entity without replaying its events.
+    /// See [`Database::get`](crate::Database::get); uses one committed view per call.
     pub fn get(&self, table: TableId, id: u64) -> Result<Option<Entity>> {
-        self.ready()?;
-        self.definition(table)?;
-        let current = match self.overlay.get(&(table, id)) {
-            Some(data) => Some(data.current.clone()),
-            None => self.root.current(&self.pager, table, id)?,
-        };
-        Ok(current.filter(|entity| !entity.deleted))
+        self.state.get(table, id)
     }
-    /// Reconstructs a retained version, using a snapshot when available.
+    /// See [`Database::get_at_version`](crate::Database::get_at_version); uses one committed view per call.
     pub fn get_at_version(&self, table: TableId, id: u64, version: u64) -> Result<Entity> {
-        self.ready()?;
-        let definition = self.definition(table)?;
-        if let Some(data) = self.overlay.get(&(table, id)) {
-            return data.at(definition, version, true);
-        }
-        self.root.at(&self.pager, table, id, version, true)
+        self.state.get_at_version(table, id, version)
     }
-    /// Replays retained history from its base through the current version.
+    /// See [`Database::replay`](crate::Database::replay); uses one committed view per call.
     pub fn replay(&self, table: TableId, id: u64) -> Result<Entity> {
-        self.ready()?;
-        let definition = self.definition(table)?;
-        if let Some(data) = self.overlay.get(&(table, id)) {
-            return data.at(definition, data.current.version, false);
-        }
-        let current = self
-            .root
-            .current(&self.pager, table, id)?
-            .ok_or_else(|| Error::NotFound(format!("entity {id}")))?;
-        self.root.at(&self.pager, table, id, current.version, false)
+        self.state.replay(table, id)
     }
-    /// Replays retained history from its base through a specific version.
+    /// See [`Database::replay_to_version`](crate::Database::replay_to_version); uses one committed view per call.
     pub fn replay_to_version(&self, table: TableId, id: u64, version: u64) -> Result<Entity> {
-        self.ready()?;
-        let definition = self.definition(table)?;
-        if let Some(data) = self.overlay.get(&(table, id)) {
-            return data.at(definition, version, false);
-        }
-        self.root.at(&self.pager, table, id, version, false)
+        self.state.replay_to_version(table, id, version)
     }
-    /// Returns retained events in entity-version order.
+    /// See [`Database::events`](crate::Database::events); uses one committed view per call.
     pub fn events(&self, table: TableId, id: u64) -> Result<Vec<Event>> {
-        self.ready()?;
-        Ok(self
-            .load(table, id)?
-            .ok_or_else(|| Error::NotFound(format!("entity {id}")))?
-            .events)
+        self.state.events(table, id)
     }
-    /// Returns the inclusive range of reconstructible entity versions.
+    /// See [`Database::retained_range`](crate::Database::retained_range); uses one committed view per call.
     pub fn retained_range(&self, table: TableId, id: u64) -> Result<(u64, u64)> {
-        self.ready()?;
-        let data = self
-            .load(table, id)?
-            .ok_or_else(|| Error::NotFound(format!("entity {id}")))?;
-        Ok((data.base.version, data.current.version))
+        self.state.retained_range(table, id)
     }
     /// Retains the latest N events and atomically advances the retained base.
     pub fn retain_last(&mut self, table: TableId, id: u64, count: usize) -> Result<()> {
         self.write(|tx| tx.retain_last(table, id, count))
     }
-    /// Visits live entities in ID order. Records are loaded one at a time.
-    ///
-    /// The scan reads each record through the primary-index entry it already
-    /// holds, so visiting an entity costs one heap read rather than a second
-    /// descent through the tree.
-    pub fn scan(&self, table: TableId, mut visit: impl FnMut(Entity) -> Result<()>) -> Result<()> {
-        self.ready()?;
-        self.definition(table)?;
-        self.visit_entries(table, |id, locator| {
-            let entity = match self.overlay.get(&(table, id)) {
-                Some(data) => data.current.clone(),
-                None => {
-                    let locator = locator.ok_or_else(|| corrupt("scanned entity has no record"))?;
-                    self.root.state(&self.pager, table, 0, locator[0], id)?
-                }
-            };
-            if !entity.deleted {
-                visit(entity)?;
-            }
-            Ok(())
-        })
-    }
-    fn definition(&self, id: TableId) -> Result<&Table> {
-        self.catalog
-            .get(&id)
-            .ok_or_else(|| Error::NotFound(format!("table {id}")))
+    /// Visits live entities in ID order using one committed view.
+    pub fn scan(&self, table: TableId, visit: impl FnMut(Entity) -> Result<()>) -> Result<()> {
+        self.state.scan(table, visit)
     }
     fn load(&self, table: TableId, id: u64) -> Result<Option<EntityData>> {
-        self.definition(table)?;
-        if let Some(data) = self.overlay.get(&(table, id)) {
-            return Ok(Some(data.clone()));
-        }
-        self.root.entity(&self.pager, table, id)
+        self.state.load(table, id)
     }
-    /// Visits every live identifier of a table in order, merging disk and overlay.
-    ///
-    /// The visitor also receives the primary-index entry of an entity that has
-    /// a checkpointed record, so a caller that only needs the current state can
-    /// read it directly instead of descending the tree a second time. `None`
-    /// marks an entity that exists only in the overlay.
-    fn visit_entries(
-        &self,
-        table: TableId,
-        mut visit: impl FnMut(u64, Option<index::Value>) -> Result<()>,
-    ) -> Result<()> {
-        let disk: Box<dyn Iterator<Item = Result<(u64, index::Value)>>> =
-            if self.root.catalog.contains_key(&table) {
-                Box::new(
-                    index::scan(
-                        &self.pager,
-                        self.root.file(table, 3),
-                        self.root.lsn,
-                        [0, 0],
-                        [u64::MAX, u64::MAX],
-                    )?
-                    .map(|entry| entry.map(|(key, value)| (key[0], value))),
-                )
-            } else {
-                Box::new(std::iter::empty())
-            };
-        let mut disk = disk.peekable();
-        let mut recent = self
-            .overlay
-            .range((table, 0)..=(table, u64::MAX))
-            .map(|(&(t, id), _)| {
-                debug_assert_eq!(t, table);
-                id
-            })
-            .peekable();
-        loop {
-            let old = match disk.peek() {
-                Some(Ok((id, value))) => Some((*id, *value)),
-                Some(Err(_)) => return Err(disk.next().unwrap().unwrap_err()),
-                None => None,
-            };
-            let new = recent.peek().copied();
-            let id = match (old.map(|(id, _)| id), new) {
-                (None, None) => break,
-                (Some(a), Some(b)) => a.min(b),
-                (Some(a), None) => a,
-                (None, Some(b)) => b,
-            };
-            let locator = old.filter(|&(old, _)| old == id).map(|(_, value)| value);
-            if locator.is_some() {
-                disk.next();
-            }
-            if new == Some(id) {
-                recent.next();
-            }
-            visit(id, locator)?;
+    /// Returns an independent, cloneable reader.
+    pub fn reader(&self) -> crate::Reader {
+        crate::Reader {
+            shared: self.readers.clone(),
         }
-        Ok(())
     }
-
+    /// Pins the current committed view.
+    pub fn read_snapshot(&self) -> Result<crate::ReadSnapshot> {
+        self.reader().pin()
+    }
+    /// Reports files retained by pinned snapshots.
+    pub fn snapshot_stats(&self) -> crate::SnapshotStats {
+        self.readers.stats()
+    }
     /// Publishes every live entity into one new generation, releasing all others.
     ///
     /// This is the collector's full pass: it reclaims every superseded record at
@@ -470,6 +371,7 @@ impl Database {
     /// generations its policy selects.
     pub fn compact(&mut self) -> Result<()> {
         let all = self
+            .state
             .root
             .generations
             .iter()
@@ -481,12 +383,13 @@ impl Database {
     ///
     /// The counts are maintained at publication, so reading them costs no I/O.
     pub fn generations(&self) -> Vec<GenerationStats> {
-        self.root
+        self.state
+            .root
             .generations
             .iter()
             .enumerate()
             .map(|(slot, entry)| {
-                let total = self.root.totals(slot as u8);
+                let total = self.state.root.totals(slot as u8);
                 GenerationStats {
                     generation: entry.generation,
                     entities: total.entities,
@@ -517,8 +420,8 @@ impl Database {
     fn collection_plan(&self) -> BTreeMap<u64, u64> {
         let mut plan = BTreeMap::new();
         let mut queue = Vec::new();
-        for (slot, entry) in self.root.generations.iter().enumerate() {
-            let total = self.root.totals(slot as u8);
+        for (slot, entry) in self.state.root.generations.iter().enumerate() {
+            let total = self.state.root.totals(slot as u8);
             let live = total.entities - total.dead;
             if live == 0 {
                 // Nothing to copy: the files can go at no cost.
@@ -530,7 +433,7 @@ impl Database {
         }
         // Generations that lost density first, cheapest first within each group.
         queue.sort_unstable();
-        let mut slots = self.root.generations.len() - plan.len() + 1;
+        let mut slots = self.state.root.generations.len() - plan.len() + 1;
         let mut budget = match self.options.collect_entities {
             0 => u64::MAX,
             limit => limit as u64,
@@ -577,37 +480,40 @@ impl Database {
             .filter(|&(_, &quota)| quota == u64::MAX)
             .map(|(&generation, _)| generation)
             .collect();
-        let (generations, slots) = self.root.rebuild_slots(&absorb, generation, self.lsn)?;
+        let (generations, slots) =
+            self.state
+                .root
+                .rebuild_slots(&absorb, generation, self.state.lsn)?;
         let new_slot = (generations.len() - 1) as u8;
         let mut quotas = [0; heap::MAX_SLOTS];
-        for (old, entry) in self.root.generations.iter().enumerate() {
+        for (old, entry) in self.state.root.generations.iter().enumerate() {
             if let Some(slot) = slots[old] {
                 quotas[usize::from(slot)] = plan.get(&entry.generation).copied().unwrap_or(0);
             }
         }
         let mut root = Root {
             generation,
-            lsn: self.lsn,
-            catalog: self.catalog.clone(),
+            lsn: self.state.lsn,
+            catalog: (*self.state.catalog).clone(),
             generations,
-            files: self.root.kept_files(&absorb),
-            occupancy: self.root.kept_occupancy(&slots),
+            files: self.state.root.kept_files(&absorb),
+            occupancy: self.state.root.kept_occupancy(&slots),
         };
-        for &table in self.catalog.keys() {
+        for &table in self.state.catalog.keys() {
             let mut writer = TableWriter::create(
                 &self.directory,
                 table,
                 generation,
                 new_slot,
-                self.lsn,
+                self.state.lsn,
                 self.options.history_segment_bytes,
                 self.options.compress_history,
             )?;
             let occupancy = &mut root.occupancy;
             let quotas = &mut quotas;
-            self.visit_entries(table, |id, locator| {
+            self.state.visit_entries(table, |id, locator| {
                 if let Some(value) = locator {
-                    let touched = self.overlay.contains_key(&(table, id));
+                    let touched = self.state.overlay.contains_key(&(table, id));
                     match slots[usize::from(snapshot::entity_slot(value)?)] {
                         // The generation leaves the manifest, so every entity of
                         // it moves and no counter outlives the move.
@@ -642,7 +548,7 @@ impl Database {
             fault("checkpoint-files");
         }
         let payload = root.encode();
-        frame::append(&mut catalog_file, 4, self.lsn, &payload)?;
+        frame::append(&mut catalog_file, 4, self.state.lsn, &payload)?;
         catalog_file.sync_all()?;
         snapshot::sync_directory(&self.directory.join("catalog"))?;
         fault("checkpoint-catalog");
@@ -655,24 +561,35 @@ impl Database {
             .write(true)
             .create_new(true)
             .open(path)?;
-        let encoded = frame::encode(1, self.lsn, &payload)?;
+        let encoded = frame::encode(1, self.state.lsn, &payload)?;
         // From this point a failed publication could be recovered as complete.
         // Refuse further writes to the previous WAL until recovery resolves it.
-        self.poisoned = true;
-        wal.write_all(&encoded[..encoded.len() / 2])?;
-        fault("checkpoint-wal-partial");
-        wal.write_all(&encoded[encoded.len() / 2..])?;
-        wal.sync_all()?;
-        snapshot::sync_directory(&self.directory.join("wal"))?;
-        fault("checkpoint-published");
-        let previous = std::mem::replace(&mut self.root, root);
+        let publication = (|| -> Result<()> {
+            wal.write_all(&encoded[..encoded.len() / 2])?;
+            fault("checkpoint-wal-partial");
+            wal.write_all(&encoded[encoded.len() / 2..])?;
+            wal.sync_all()?;
+            snapshot::sync_directory(&self.directory.join("wal"))?;
+            fault("checkpoint-published");
+            Ok(())
+        })();
+        if let Err(error) = publication {
+            self.state.poisoned.store(true, Ordering::Release);
+            return Err(error);
+        }
+        let state = Arc::make_mut(&mut self.state);
+        let previous = std::mem::replace(&mut state.root, Arc::new(root));
         self.wal = wal;
-        self.overlay.clear();
-        self.poisoned = false;
+        Arc::make_mut(&mut self.state).overlay.clear();
+        self.readers.publish(self.state.clone());
         // Publication succeeded: cleanup errors do not invalidate acknowledged commits.
-        let keep: BTreeSet<_> = previous.file_ids().chain(self.root.file_ids()).collect();
+        let mut keep: BTreeSet<_> = previous
+            .file_ids()
+            .chain(self.state.root.file_ids())
+            .collect();
+        keep.extend(self.readers.pinned_files());
         // Closing a descriptor before deleting its file also satisfies Windows.
-        self.pager.forget(|file| !keep.contains(&file));
+        self.state.pager.forget(|file| !keep.contains(&file));
         self.cleanup(previous.generation, &keep)?;
         fault("checkpoint-cleanup");
         Ok(())
@@ -689,7 +606,7 @@ impl Database {
             }
         }
         for (number, path) in numbered_files(&self.directory.join("catalog"), "catalog")? {
-            if number != previous && number != self.root.generation {
+            if number != previous && number != self.state.root.generation {
                 fs::remove_file(path)?;
             }
         }
@@ -731,7 +648,7 @@ pub struct Transaction<'a> {
 impl<'a> Transaction<'a> {
     fn new(db: &'a mut Database) -> Self {
         Self {
-            catalog: db.catalog.clone(),
+            catalog: (*db.state.catalog).clone(),
             db,
             staged: BTreeMap::new(),
             operations: Vec::new(),
@@ -801,7 +718,7 @@ impl<'a> Transaction<'a> {
         if let Some(data) = self.staged.get(&(table, id)) {
             return Ok((!data.current.deleted).then(|| data.current.clone()));
         }
-        if !self.db.catalog.contains_key(&table) {
+        if !self.db.state.catalog.contains_key(&table) {
             return Ok(None);
         }
         self.db.get(table, id)
@@ -859,7 +776,7 @@ impl<'a> Transaction<'a> {
         let table = self.table(table_id)?.clone();
         let existing = if let Some(data) = self.staged.get(&(table_id, id)) {
             Some(data.clone())
-        } else if self.db.catalog.contains_key(&table_id) {
+        } else if self.db.state.catalog.contains_key(&table_id) {
             self.db.load(table_id, id)?
         } else {
             None
@@ -905,7 +822,7 @@ impl<'a> Transaction<'a> {
                             version: data.current.version.checked_add(1).ok_or_else(|| {
                                 Error::Invalid("entity versions exhausted".into())
                             })?,
-                            transaction: self.db.lsn.checked_add(1).ok_or_else(|| {
+                            transaction: self.db.state.lsn.checked_add(1).ok_or_else(|| {
                                 Error::Invalid("transaction sequence exhausted".into())
                             })?,
                             schema_version: table.schema().version,
@@ -946,10 +863,11 @@ impl<'a> Transaction<'a> {
             ));
         }
         if self.operations.is_empty() {
-            return Ok(self.db.lsn);
+            return Ok(self.db.state.lsn);
         }
         let lsn = self
             .db
+            .state
             .lsn
             .checked_add(1)
             .ok_or_else(|| Error::Invalid("transaction sequence exhausted".into()))?;
@@ -969,16 +887,22 @@ impl<'a> Transaction<'a> {
             Ok(())
         })();
         if let Err(e) = result {
-            self.db.poisoned = true;
+            self.db.state.poisoned.store(true, Ordering::Release);
             return Err(Error::CommitUnknown(e));
         }
         self.publish(lsn);
         Ok(lsn)
     }
     fn publish(self, lsn: u64) {
-        self.db.catalog = self.catalog;
-        self.db.overlay.extend(self.staged);
-        self.db.lsn = lsn;
+        let state = Arc::make_mut(&mut self.db.state);
+        state.catalog = Arc::new(self.catalog);
+        state.overlay.extend(
+            self.staged
+                .into_iter()
+                .map(|(key, data)| (key, Arc::new(data))),
+        );
+        state.lsn = lsn;
+        self.db.readers.publish(self.db.state.clone());
     }
 }
 

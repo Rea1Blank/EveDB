@@ -117,6 +117,8 @@ transaction keep separate entity versions and share the transaction sequence.
 | `Database::open[_with_options]` | Initialize an empty directory or lock, verify, and recover an existing database |
 | `create_table`, `transaction` / `write` | Define tables; group schema and entity operations in an atomic transaction |
 | `create`, `apply`, `delete` | Create state, append assignments, or append a deletion tombstone |
+| `reader`, `read_snapshot` | Cloneable reader with one committed view per call, or a pinned view across calls |
+| `snapshot_stats` | Active pins, oldest sequence, and unique checkpoint bytes referenced by pins |
 | `get` | Read current state through the overlay or primary index and heap, without replay |
 | `get_at_version` | Seek to the closest eligible snapshot or retained base, then read only the required event range |
 | `replay`, `replay_to_version` | Reconstruct from the retained base, deliberately bypassing acceleration snapshots |
@@ -145,12 +147,15 @@ A transaction exclusively borrows the database handle, stages touched entities
 and catalog changes, and validates each write before committing. A failed write
 aborts the transaction; dropping a transaction discards it. The complete operation
 batch is encoded into one checked WAL frame. `sync_all` must succeed before the
-staged changes become visible or commit returns success. A mutex can serialize
-access to one handle across threads; there are no concurrent MVCC readers yet.
+staged changes become visible or commit returns success. Independent readers
+run concurrently with staging, commit, and checkpoints. Each reader call pins
+one published view; an explicit snapshot pins it across calls, including catalog
+and retained history. Readers do not expose staged writes.
 
 On a WAL write/sync error, `CommitUnknown` means that reopening may find either
 the complete transaction or no transaction. Data operations on that handle
-return `NeedsRecovery` until it is dropped and reopened. A caller must resolve
+return `NeedsRecovery` until all handles and snapshots are dropped and the
+database is reopened. A caller must resolve
 this outcome before retrying a non-idempotent write. Catalog/sequence accessors
 still expose the last published metadata; they do not establish a failed commit's
 outcome. A checkpoint failure after publication starts also requires recovery.
@@ -168,7 +173,14 @@ Checkpointing proceeds as follows:
 4. Create a new WAL segment whose first frame contains that complete root;
    synchronize it before publishing the new generation in memory.
 5. Retain the preceding usable checkpoint and the WAL needed to replay from it.
-   Delete every file that neither the new nor the retained manifest names.
+   Delete every file that neither those manifests nor live snapshots name.
+
+Snapshots retain their checkpoint files and the OS directory lock. Dropping a
+snapshot permits reclamation on a later successful checkpoint. An idle reader
+keeps the newest view and the lock alive. Snapshot statistics count independent
+pins (clones share one) and unique referenced checkpoint bytes, including files
+also used by the current view. Uncertain storage failures stop data operations
+on all readers, including older snapshots.
 
 The WAL's initial root frame is the publication record; the catalog file is a
 separate copy. Recovery enumerates WAL roots, verifies checkpoint files, selects
@@ -292,12 +304,9 @@ despite indexed historical reads.
 
 Collection runs inside the checkpoint that publishes next, on the thread that
 writes, and `collect_entities` is what bounds that pause. Nothing runs in the
-background: one handle owns the database exclusively, so there is no reader to
-keep serving while a collector works. The pieces a background collector needs are
-in place — the decision is a counter lookup rather than a scan, the copying reads
-only published immutable files, and only the final manifest swap has to be
-exclusive — but moving that copying off the writing path requires concurrent
-readers first.
+background. Independent readers keep serving pinned views while collection
+runs. Background collection still needs a captured frontier and publication
+protocol that preserves writes arriving after that frontier.
 
 There is no server protocol, SQL/query planner, secondary field index, online
 backup/archive format, background maintenance, table drop, or schema migration

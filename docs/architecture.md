@@ -22,6 +22,7 @@ The core modules have the following responsibilities:
 | --- | --- |
 | `model` | Typed schemas, entities, events, version reconstruction, retention |
 | `database` | Public API, transaction staging, WAL recovery, checkpoint publication |
+| `reader` | Immutable committed views, cloneable readers, snapshot pins and retention statistics |
 | `snapshot` | Generation manifests, slot addressing, occupancy counts, table readers/writers, indexed historical reads, compression |
 | `storage/page` | Checked 8 KiB slotted-page format |
 | `storage/pager` | Bounded cache of decoded pages and open checkpoint files |
@@ -39,8 +40,18 @@ entities a transaction touched, leaves the rest in the generations that already
 hold them, and publishes a manifest addressing every referenced generation. It
 also collects generations that have lost density or exceed the generation budget,
 rewriting their live entities. A recovery baseline is retained, and files no
-manifest references are deleted. There are no in-place tree updates, MVCC, or
-asynchronous workers: collection runs on the writing thread.
+manifest or live snapshot references are deleted. Cloneable readers acquire one
+immutable view per operation; pinned snapshots keep their catalog, overlay, and
+checkpoint files across operations. They retain the directory lock even after
+the writer drops. Readers do not hold a publication lock during I/O or callbacks.
+There are no in-place tree updates or asynchronous workers: collection runs on
+the writing thread.
+
+Published states share roots, catalogs, and individual overlay entities. Updating
+a shared state currently copies its overlay map, not entity histories. This is
+a throughput/memory limit scheduled for replacement in the production roadmap.
+Pin statistics report unique referenced checkpoint bytes, not total memory or
+bytes exclusively retained by old snapshots.
 
 The [storage design](storage.md) explains the borrowed database techniques,
 actual file layout, synchronization protocol, and experimental limits. The
