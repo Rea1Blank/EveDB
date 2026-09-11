@@ -17,6 +17,13 @@ pub enum Error {
     AlreadyExists(String),
     /// Another database handle owns the data directory.
     Locked,
+    /// An admission limit was reached before the requested write was accepted.
+    LimitExceeded {
+        /// The bounded resource.
+        resource: &'static str,
+        /// Configured maximum (bytes or item count, according to resource).
+        limit: usize,
+    },
     /// A requested isolation level is not implemented; no transaction was started.
     UnsupportedIsolation(crate::IsolationLevel),
     /// A concurrent commit invalidated this transaction. Retry the whole transaction.
@@ -50,6 +57,9 @@ impl fmt::Display for Error {
             Self::NotFound(s) => write!(f, "not found: {s}"),
             Self::AlreadyExists(s) => write!(f, "already exists: {s}"),
             Self::Locked => f.write_str("the data directory is already open"),
+            Self::LimitExceeded { resource, limit } => {
+                write!(f, "limit exceeded: {resource} (maximum {limit})")
+            }
             Self::UnsupportedIsolation(level) => {
                 write!(f, "unsupported isolation level: {level:?}")
             }

@@ -92,7 +92,7 @@ impl SharedDatabase {
             return Err(Error::UnsupportedIsolation(options.isolation));
         }
         let pin = self.reader.pin()?;
-        Ok(Transaction::shared(self.clone(), pin, self.options.clone()))
+        Transaction::shared(self.clone(), pin, self.options.clone())
     }
     /// Runs a transaction without automatic retries. The closure may have side effects.
     pub fn write<T>(
@@ -103,6 +103,10 @@ impl SharedDatabase {
         let result = operation(&mut tx)?;
         tx.commit()?;
         Ok(result)
+    }
+    /// Returns current admission counters.
+    pub fn resource_usage(&self) -> crate::ResourceUsage {
+        self.reader.resource_usage()
     }
     /// Returns an independent reader exposing the full read API.
     pub fn reader(&self) -> Reader {

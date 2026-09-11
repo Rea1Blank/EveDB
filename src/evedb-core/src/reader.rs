@@ -4,6 +4,7 @@ use crate::{
     Entity, Error, Event, Result, Table, TableId,
     error::corrupt,
     model::EntityData,
+    resources::{Permit, Reservation, Resources},
     snapshot::Root,
     storage::{
         index,
@@ -25,6 +26,8 @@ pub(crate) struct ReadState {
     pub catalog: Arc<BTreeMap<TableId, Table>>,
     pub overlay: BTreeMap<(TableId, u64), Arc<EntityData>>,
     pub lsn: u64,
+    pub resources: Arc<Resources>,
+    pub charges: Vec<Arc<Reservation>>,
     pub pager: Arc<Pager>,
     pub _lock: Arc<File>,
     pub poisoned: Arc<AtomicBool>,
@@ -202,6 +205,7 @@ impl ReadState {
 }
 
 struct SnapshotPin {
+    _permit: Permit,
     state: Arc<ReadState>,
 }
 pub(crate) struct ReaderShared {
@@ -273,6 +277,15 @@ pub struct Reader {
     pub(crate) shared: Arc<ReaderShared>,
 }
 impl Reader {
+    /// Returns current admission counters without acquiring a snapshot pin.
+    pub fn resource_usage(&self) -> crate::ResourceUsage {
+        self.shared
+            .current
+            .read()
+            .expect("published state")
+            .resources
+            .usage()
+    }
     /// Pins a coherent catalog, current state, and retained history.
     /// The snapshot keeps checkpoint files and the directory lock alive.
     pub fn pin(&self) -> Result<ReadSnapshot> {
@@ -282,7 +295,19 @@ impl Reader {
             .read()
             .map_err(|_| Error::NeedsRecovery)?;
         state.ready()?;
+        let bytes = state
+            .root
+            .file_sizes()
+            .try_fold(0usize, |sum, (_, size)| {
+                sum.checked_add(usize::try_from(size).unwrap_or(usize::MAX))
+            })
+            .ok_or(Error::LimitExceeded {
+                resource: "pinned checkpoint bytes",
+                limit: state.resources.limits.max_pinned_bytes,
+            })?;
+        let permit = state.resources.snapshot(bytes)?;
         let pin = Arc::new(SnapshotPin {
+            _permit: permit,
             state: state.clone(),
         });
         let mut pins = self.shared.pins.lock().map_err(|_| Error::NeedsRecovery)?;

@@ -272,6 +272,20 @@ pub(crate) fn apply_event(state: &mut Entity, event: &Event, table: &Table) -> R
     Ok(())
 }
 
+pub(crate) fn fields_encoded_len(fields: &Fields) -> usize {
+    8 + fields
+        .values()
+        .map(|value| {
+            5 + match value {
+                Value::Null => 0,
+                Value::Bool(_) => 1,
+                Value::Text(text) => 8 + text.len(),
+                Value::Bytes(bytes) => 8 + bytes.len(),
+                _ => 8,
+            }
+        })
+        .sum::<usize>()
+}
 pub(crate) fn encode_fields(fields: &Fields, e: &mut Encoder) {
     e.u64(fields.len() as u64);
     for (&id, value) in fields {
