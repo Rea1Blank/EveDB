@@ -71,6 +71,10 @@ Merge only the reviewed head after required checks pass. The first delivery is
 steps 1–3; subsequent steps are release requirements, not a claim that the first
 delivery qualifies for production.
 
+Steps 1–3 are implemented. See [concurrent transactions](docs/transactions.md)
+for the API, exact guarantees, failure semantics, and remaining limits. Step 4
+is next; no production throughput SLO has been qualified yet.
+
 | Step | Deliverable | Acceptance gate |
 | --- | --- | --- |
 | 1 | Product requirements and architectural contracts | Deferred capabilities and current limitations are explicit. |
