@@ -293,3 +293,62 @@ fn byte_queue_and_group_limits_are_enforced_independently() {
     }
     assert_eq!(db.coordinator.lock().unwrap().database.wal_syncs - syncs, 2);
 }
+
+#[test]
+fn automatic_checkpoints_prune_revisions_but_preserve_live_writer_conflicts() {
+    let dir = TempDir::new();
+    let db = SharedDatabase::open_with_options(
+        &dir.0,
+        Options {
+            checkpoint_bytes: 4096,
+            snapshot_interval: 0,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let table = db
+        .create_table(
+            "items",
+            Schema::new(vec![Field {
+                id: 1,
+                name: "value".into(),
+                data_type: DataType::UInt64,
+                nullable: false,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+    db.create(table, 1, [(1, Value::UInt64(1))].into()).unwrap();
+    let mut stale = db.transaction().unwrap();
+    stale
+        .apply(table, 1, [(1, Value::UInt64(99))].into())
+        .unwrap();
+    db.apply(table, 1, [(1, Value::UInt64(2))].into()).unwrap();
+    for id in 2..180 {
+        db.create(table, id, [(1, Value::UInt64(id))].into())
+            .unwrap();
+    }
+    assert!(
+        db.coordinator
+            .lock()
+            .unwrap()
+            .database
+            .checkpoint_generation()
+            > 0
+    );
+    assert!(matches!(stale.commit(), Err(Error::Conflict { .. })));
+    for id in 180..360 {
+        db.create(table, id, [(1, Value::UInt64(id))].into())
+            .unwrap();
+    }
+    let coordinator = db.coordinator.lock().unwrap();
+    assert!(
+        coordinator.revisions.len() < 100,
+        "automatic checkpoints must release unneeded conflict revisions"
+    );
+    drop(coordinator);
+    assert_eq!(
+        db.get(table, 1).unwrap().unwrap().fields[&1],
+        Value::UInt64(2)
+    );
+}

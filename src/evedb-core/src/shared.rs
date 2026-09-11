@@ -347,6 +347,7 @@ impl SharedDatabase {
             metadata.push((ticket, keys, changes_catalog));
             accepted.push(batch);
         }
+        let before = coordinator.database.checkpoint_generation();
         let results = Prepared::commit_group(accepted, &mut coordinator.database);
         for ((ticket, keys, catalog), result) in metadata.into_iter().zip(results) {
             if let Ok(sequence) = &result {
@@ -358,6 +359,9 @@ impl SharedDatabase {
                 }
             }
             completed.push((ticket, result));
+        }
+        if coordinator.database.checkpoint_generation() != before {
+            Self::prune_revisions(&mut coordinator);
         }
         drop(coordinator);
         leadership.tickets.clear();
