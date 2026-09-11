@@ -47,6 +47,13 @@ pub struct Options {
     /// that publishes next, which bounds open files, startup verification, and
     /// manifest size.
     pub max_generations: usize,
+    /// Entities one checkpoint may copy for collection; zero removes the cap.
+    ///
+    /// Collection runs inside the checkpoint, so this is what bounds the pause
+    /// it adds. A generation too large to drain at once is drained across
+    /// several checkpoints, and the generation budget waits for it rather than
+    /// forcing one long pause.
+    pub collect_entities: usize,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -60,6 +67,7 @@ impl Default for Options {
             max_open_files: pager::DEFAULT_OPEN_FILES,
             compact_live_ratio: 0.5,
             max_generations: 8,
+            collect_entities: 8192,
         }
     }
 }
@@ -465,7 +473,7 @@ impl Database {
             .root
             .generations
             .iter()
-            .map(|entry| entry.generation)
+            .map(|entry| (entry.generation, u64::MAX))
             .collect();
         self.publish(all)
     }
@@ -495,38 +503,63 @@ impl Database {
     /// checkpoint and its WAL are kept for recovery, and checkpointing is
     /// synchronous.
     pub fn checkpoint(&mut self) -> Result<()> {
-        let absorb = self.collectable();
-        self.publish(absorb)
+        let plan = self.collection_plan();
+        self.publish(plan)
     }
-    /// Chooses the generations whose live entities this checkpoint will rewrite.
+    /// Chooses how many live entities of each generation this checkpoint moves.
     ///
     /// A generation is collected once it loses density, holds nothing live, or
-    /// has to make room within the manifest's generation budget. Choosing the
-    /// emptiest generation for the budget reclaims a slot for the least copying.
-    fn collectable(&self) -> BTreeSet<u64> {
-        let mut absorb = BTreeSet::new();
-        let mut kept = Vec::new();
+    /// has to make room within the manifest's generation budget; the emptiest
+    /// generation goes first, because it frees a slot for the least copying.
+    /// `collect_entities` caps the copying one checkpoint performs, so a
+    /// generation too large to drain at once is drained over several. A quota of
+    /// [`u64::MAX`] collects a generation whole and releases its files.
+    fn collection_plan(&self) -> BTreeMap<u64, u64> {
+        let mut plan = BTreeMap::new();
+        let mut queue = Vec::new();
         for (slot, entry) in self.root.generations.iter().enumerate() {
             let total = self.root.totals(slot as u8);
-            if total.live_ratio() < self.options.compact_live_ratio || total.entities == total.dead
-            {
-                absorb.insert(entry.generation);
+            let live = total.entities - total.dead;
+            if live == 0 {
+                // Nothing to copy: the files can go at no cost.
+                plan.insert(entry.generation, u64::MAX);
             } else {
-                kept.push((total.entities - total.dead, entry.generation));
+                let sparse = total.live_ratio() < self.options.compact_live_ratio;
+                queue.push((!sparse, live, entry.generation));
             }
         }
-        kept.sort_unstable();
-        let mut over = (kept.len() + 1).saturating_sub(self.options.max_generations);
-        for &(_, generation) in &kept {
-            if over == 0 {
+        // Generations that lost density first, cheapest first within each group.
+        queue.sort_unstable();
+        let mut slots = self.root.generations.len() - plan.len() + 1;
+        let mut budget = match self.options.collect_entities {
+            0 => u64::MAX,
+            limit => limit as u64,
+        };
+        for &(dense, live, generation) in &queue {
+            if budget == 0 || (dense && slots <= self.options.max_generations) {
                 break;
             }
-            absorb.insert(generation);
-            over -= 1;
+            if live > budget {
+                plan.insert(generation, budget);
+                break;
+            }
+            plan.insert(generation, u64::MAX);
+            budget -= live;
+            slots -= 1;
         }
-        absorb
+        // The generation budget yields to a bounded pause, but the format's slot
+        // limit cannot: drain whole generations until the manifest fits.
+        for &(_, _, generation) in &queue {
+            if slots < heap::MAX_SLOTS {
+                break;
+            }
+            if plan.insert(generation, u64::MAX) != Some(u64::MAX) {
+                slots -= 1;
+            }
+        }
+        plan
     }
-    fn publish(&mut self, absorb: BTreeSet<u64>) -> Result<()> {
+    fn publish(&mut self, plan: BTreeMap<u64, u64>) -> Result<()> {
         self.ready()?;
         let generation = self.next_generation;
         self.next_generation = generation
@@ -537,8 +570,21 @@ impl Database {
             .join("catalog")
             .join(format!("{generation:020}.catalog"));
         let mut catalog_file = File::create_new(catalog_path)?;
+        // A generation the plan drains completely leaves the manifest; one it
+        // drains partially keeps its slot and carries the quota into the pass.
+        let absorb: BTreeSet<_> = plan
+            .iter()
+            .filter(|&(_, &quota)| quota == u64::MAX)
+            .map(|(&generation, _)| generation)
+            .collect();
         let (generations, slots) = self.root.rebuild_slots(&absorb, generation, self.lsn)?;
         let new_slot = (generations.len() - 1) as u8;
+        let mut quotas = [0; heap::MAX_SLOTS];
+        for (old, entry) in self.root.generations.iter().enumerate() {
+            if let Some(slot) = slots[old] {
+                quotas[usize::from(slot)] = plan.get(&entry.generation).copied().unwrap_or(0);
+            }
+        }
         let mut root = Root {
             generation,
             lsn: self.lsn,
@@ -558,18 +604,29 @@ impl Database {
                 self.options.compress_history,
             )?;
             let occupancy = &mut root.occupancy;
+            let quotas = &mut quotas;
             self.visit_entries(table, |id, locator| {
-                // An untouched entity whose generation survives keeps its records
-                // and only moves its primary-index entry into the new tree.
-                if let Some(value) = locator.filter(|_| !self.overlay.contains_key(&(table, id))) {
-                    if let Some(slot) = slots[usize::from(snapshot::entity_slot(value)?)] {
-                        return writer.carry(id, snapshot::remap(value, slot));
+                if let Some(value) = locator {
+                    let touched = self.overlay.contains_key(&(table, id));
+                    match slots[usize::from(snapshot::entity_slot(value)?)] {
+                        // The generation leaves the manifest, so every entity of
+                        // it moves and no counter outlives the move.
+                        None => {}
+                        Some(slot) => {
+                            let quota = &mut quotas[usize::from(slot)];
+                            if !touched && *quota == 0 {
+                                // Untouched, and its generation is not being
+                                // drained: the records stay where they are and
+                                // only the index entry moves.
+                                return writer.carry(id, snapshot::remap(value, slot));
+                            }
+                            if !touched {
+                                *quota -= 1;
+                            }
+                            // A rewritten entity leaves an unreachable copy behind.
+                            occupancy.entry((table, slot)).or_default().dead += 1;
+                        }
                     }
-                } else if let Some(value) = locator
-                    && let Some(slot) = slots[usize::from(snapshot::entity_slot(value)?)]
-                {
-                    // A rewritten entity leaves an unreachable copy behind.
-                    occupancy.entry((table, slot)).or_default().dead += 1;
                 }
                 let data = self
                     .load(table, id)?

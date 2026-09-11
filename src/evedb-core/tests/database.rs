@@ -483,6 +483,50 @@ fn a_generation_is_collected_once_it_loses_density() {
 }
 
 #[test]
+fn collection_is_spread_over_checkpoints_when_it_exceeds_its_budget() {
+    let dir = TestDir::new();
+    let mut db = Database::open_with_options(
+        &dir.0,
+        Options {
+            // Mark the first generation for collection as soon as it loses one
+            // entity, then let only two entities move per checkpoint.
+            compact_live_ratio: 0.9,
+            collect_entities: 2,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let table = db.create_table("items", schema()).unwrap();
+    for id in 1..=7 {
+        db.create(table, id, fields(id as i64)).unwrap();
+    }
+    db.checkpoint().unwrap();
+    let draining = db.generations()[0].generation;
+    db.apply(table, 1, fields(100)).unwrap();
+    let live = |db: &Database| {
+        db.generations()
+            .iter()
+            .find(|entry| entry.generation == draining)
+            .map(|entry| entry.entities - entry.dead)
+    };
+    // The first checkpoint publishes the rewritten entity, which is what marks
+    // the generation for collection; the remaining six then move two at a time.
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        db.checkpoint().unwrap();
+        seen.push(live(&db));
+    }
+    assert_eq!(seen, [Some(6), Some(4), Some(2), None]);
+    for id in 1..=7 {
+        let expected = if id == 1 { 100 } else { id };
+        assert_eq!(
+            db.get(table, id as u64).unwrap().unwrap().fields[&1],
+            Value::Int64(expected)
+        );
+    }
+}
+
+#[test]
 fn the_generation_budget_bounds_a_manifest() {
     let dir = TestDir::new();
     let mut db = Database::open_with_options(

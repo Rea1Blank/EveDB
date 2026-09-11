@@ -34,15 +34,15 @@ machine, in a separate session.
 
 | Operation | First | With the page cache | Incremental |
 | --- | ---: | ---: | ---: |
-| Create 10,000 entities, including automatic checkpoint work | 1,360.427 ms | 731.138 ms | 722.965 ms |
-| Explicit checkpoint after creation | 9,070.136 ms | 874.448 ms | 196.621 ms |
-| Reopen and verify checkpoint files | 77.751 ms | 82.975 ms | 79.878 ms |
-| 1,000 deterministic pseudorandom current reads | 414.378 ms | 30.781 ms | 29.645 ms |
-| Apply 300 events in one committed transaction | 9.508 ms | 9.984 ms | 9.773 ms |
-| 100 indexed historical reads | 163.198 ms | 12.840 ms | 12.446 ms |
-| 100 full replays from the retained base | 749.397 ms | 292.505 ms | 262.696 ms |
-| Scan all 10,000 active entities | 4,327.973 ms | 58.621 ms | 33.967 ms |
-| Retention and two full checkpoints | 22,934.397 ms | 1,809.103 ms | 88.079 ms |
+| Create 10,000 entities, including automatic checkpoint work | 1,360.427 ms | 731.138 ms | 721.012 ms |
+| Explicit checkpoint after creation | 9,070.136 ms | 874.448 ms | 189.750 ms |
+| Reopen and verify checkpoint files | 77.751 ms | 82.975 ms | 75.932 ms |
+| 1,000 deterministic pseudorandom current reads | 414.378 ms | 30.781 ms | 29.822 ms |
+| Apply 300 events in one committed transaction | 9.508 ms | 9.984 ms | 8.453 ms |
+| 100 indexed historical reads | 163.198 ms | 12.840 ms | 11.691 ms |
+| 100 full replays from the retained base | 749.397 ms | 292.505 ms | 265.558 ms |
+| Scan all 10,000 active entities | 4,327.973 ms | 58.621 ms | 32.925 ms |
+| Retention and two full checkpoints | 22,934.397 ms | 1,809.103 ms | 63.205 ms |
 
 Directory size was 47,632,445 bytes before retention and 47,565,864 after it in
 the first two runs, and 24,270,891 before and 24,319,042 after in the third. The
@@ -78,7 +78,7 @@ pages removed the dominant cost of every read path, because the engine had been
 reopening and revalidating a file for each lookup; the remaining per-read cost is
 decoding a record into owned memory. Maintenance no longer scales with the whole
 database, but it has not become free: a checkpoint still rebuilds the primary
-index over every live entity, which is what the third column's 196 ms mostly is.
+index over every live entity, which is what the third column's 190 ms mostly is.
 
 This benchmark also does not exercise what incremental publication costs over
 time. It writes once, then touches one entity, so no generation ever loses enough
@@ -91,5 +91,5 @@ This run does not compare engines, page sizes, clustered trees, LSM layouts, or
 compression algorithms. Future decisions need repeated cold/warm measurements,
 larger-than-RAM data under an enforced memory budget, histories of different
 lengths, compressible and random payloads, read/write mixtures, checkpoint write
-amplification, and update-heavy workloads that drive collection. Power-loss tests are separate from this benchmark and from
-the existing subprocess crash tests.
+amplification, and update-heavy workloads that drive collection. Power-loss tests
+are separate from this benchmark and from the existing subprocess crash tests.

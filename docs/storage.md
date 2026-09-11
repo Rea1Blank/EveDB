@@ -206,6 +206,17 @@ are then unreferenced and the next publication deletes them. The policy reads th
 published manifest, so a generation that loses density during one checkpoint is
 collected by the next.
 
+Collection happens inside the checkpoint, so its cost is a pause. `collect_entities`
+caps how many entities one checkpoint copies for collection, and a generation too
+large to drain at once keeps its slot and is drained across several checkpoints;
+an entity that moves is simply written earlier than the rest of its generation,
+which needs no separate mechanism because an entity already carries its own
+generation slot. The generation budget waits for a drain rather than forcing one
+long pause, so a manifest can exceed `max_generations` while collection catches
+up. Only the format's 256 slots are absolute: reaching them overrides the pause
+budget. `compact` ignores the budget by definition — it is the explicit request
+for one full pass.
+
 The budget is what bounds the design: without it a chain of generations would
 grow open descriptors, startup verification, manifest size and the residue of
 superseded records. It does not bound the read path — the primary index is
@@ -238,6 +249,7 @@ secure erasure of old bytes.
 | Page cache budget | 64 MiB of decoded checkpoint pages |
 | Open checkpoint files | 256 descriptors |
 | Collection threshold | Collect a generation below 0.5 live entities |
+| Collection budget | 8192 entities copied per checkpoint; zero removes the cap |
 | Generation budget | 8 referenced generations per manifest; 256 is the format limit |
 | Heap file size | 2^40 pages, since a locator spends one byte on its generation slot |
 | Fields per schema | 1..=4096; IDs nonzero and unique |
@@ -279,12 +291,13 @@ leaf before building parent levels, so its memory also grows with index size.
 despite indexed historical reads.
 
 Collection runs inside the checkpoint that publishes next, on the thread that
-writes. Nothing runs in the background, and nothing is prepared ahead of the
-pause, because one handle owns the database exclusively and there is no reader to
+writes, and `collect_entities` is what bounds that pause. Nothing runs in the
+background: one handle owns the database exclusively, so there is no reader to
 keep serving while a collector works. The pieces a background collector needs are
-in place — the decision is a counter lookup, the copying reads only published
-immutable files, and only the final manifest swap has to be exclusive — but
-moving that copying off the writing path requires concurrent readers first.
+in place — the decision is a counter lookup rather than a scan, the copying reads
+only published immutable files, and only the final manifest swap has to be
+exclusive — but moving that copying off the writing path requires concurrent
+readers first.
 
 There is no server protocol, SQL/query planner, secondary field index, online
 backup/archive format, background maintenance, table drop, or schema migration
@@ -313,8 +326,10 @@ schema history, snapshots, replay, retention, locks, checkpoint fallback, and
 reclamation. Incremental publication is covered by asserting that an untouched
 entity stays in its generation while the new one holds only what changed, that a
 generation is collected once it falls below the live-ratio threshold, that the
-generation budget bounds a manifest across many checkpoints, and that damage to a
-file shared by two manifests is reported instead of silently repaired. A historical-read test damages an early event after opening and
+generation budget bounds a manifest across many checkpoints, that a collection
+larger than its budget is spread over several checkpoints without losing an
+entity, and that damage to a file shared by two manifests is reported instead of
+silently repaired. A historical-read test damages an early event after opening and
 confirms that a late snapshot read succeeds while explicit replay detects damage.
 
 With the `fault-injection` feature, subprocess tests stop the writer before,
