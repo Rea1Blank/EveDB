@@ -1,0 +1,28 @@
+{
+  "name": "Restrict branch names",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "~ALL"
+      ],
+      "exclude": [
+        "~DEFAULT_BRANCH",
+        "refs/heads/dependabot/**"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "type": "branch_name_pattern",
+      "parameters": {
+        "name": "Start the branch with an approved prefix",
+        "negate": false,
+        "operator": "regex",
+        "pattern": "^(build|chore|ci|deps|docs|feature|fix|perf|refactor|release|security|test)/.+"
+      }
+    }
+  ]
+}

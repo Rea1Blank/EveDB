@@ -16,6 +16,12 @@ Historical reads request version 299; explicit replay reconstructs version 300.
 Retention keeps ten events, then writes two checkpoints to release the older
 recovery generation. Measurements include synchronous file I/O.
 
+Every pull request runs the same example twice, once on its base commit and
+once on its head, and receives one comment with the two columns and their
+difference. Marks appear beyond ten percent. That comparison is one run per
+commit on a shared GitHub runner against the numbers below, which come from a
+quiet local machine; it indicates where to look, and it does not block a merge.
+
 ## Recorded runs
 
 Two local Windows x64 runs, Rust `1.98.1-x86_64-pc-windows-gnu`, optimized

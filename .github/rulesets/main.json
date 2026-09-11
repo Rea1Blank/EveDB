@@ -41,6 +41,10 @@
         "do_not_enforce_on_create": false,
         "required_status_checks": [
           {
+            "context": "Branch name",
+            "integration_id": 15368
+          },
+          {
             "context": "Quality",
             "integration_id": 15368
           },
