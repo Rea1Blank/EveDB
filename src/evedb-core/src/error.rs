@@ -17,6 +17,15 @@ pub enum Error {
     AlreadyExists(String),
     /// Another database handle owns the data directory.
     Locked,
+    /// A requested isolation level is not implemented; no transaction was started.
+    UnsupportedIsolation(crate::IsolationLevel),
+    /// A concurrent commit invalidated this transaction. Retry the whole transaction.
+    Conflict {
+        /// Conflicting table, or None for a catalog change.
+        table: Option<crate::TableId>,
+        /// Conflicting entity, or None for a catalog change.
+        entity: Option<crate::EntityId>,
+    },
     /// The requested version is outside the locally retained range.
     VersionUnavailable {
         /// The requested entity version.
@@ -41,6 +50,13 @@ impl fmt::Display for Error {
             Self::NotFound(s) => write!(f, "not found: {s}"),
             Self::AlreadyExists(s) => write!(f, "already exists: {s}"),
             Self::Locked => f.write_str("the data directory is already open"),
+            Self::UnsupportedIsolation(level) => {
+                write!(f, "unsupported isolation level: {level:?}")
+            }
+            Self::Conflict { table, entity } => write!(
+                f,
+                "transaction conflict at table {table:?}, entity {entity:?}; retry the whole transaction"
+            ),
             Self::VersionUnavailable {
                 requested,
                 first,

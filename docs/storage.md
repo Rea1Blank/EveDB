@@ -143,8 +143,9 @@ An absent entity returns `NotFound` for history operations.
 
 ## Transactions and recovery
 
-A transaction exclusively borrows the database handle, stages touched entities
-and catalog changes, and validates each write before committing. A failed write
+A local transaction exclusively borrows `Database`; `SharedDatabase` connections
+stage independently against pinned views and validate write/catalog conflicts at
+commit. Both stage touched entities and catalog changes. A failed write
 aborts the transaction; dropping a transaction discards it. The complete operation
 batch is encoded into one checked WAL frame. `sync_all` must succeed before the
 staged changes become visible or commit returns success. Independent readers

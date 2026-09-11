@@ -15,6 +15,31 @@ fn crash_child() {
     };
     let mode = std::env::var("EVEDB_CHILD_MODE").unwrap();
     let mut db = Database::open(path).unwrap();
+    if mode == "shared-io" {
+        let db = db.into_shared();
+        let other = db.clone();
+        let reader = db.reader();
+        let snapshot = reader.pin().unwrap();
+        let mut pending = other.transaction().unwrap();
+        pending.apply(1, 1, fields(99)).unwrap();
+        let result = db.write(|tx| {
+            tx.apply(1, 1, fields(11))?;
+            tx.apply(1, 1, fields(12))?;
+            tx.apply(2, 1, fields(21))
+        });
+        assert!(matches!(result, Err(Error::CommitUnknown(_))));
+        assert!(matches!(other.transaction(), Err(Error::NeedsRecovery)));
+        assert!(matches!(reader.get(1, 1), Err(Error::NeedsRecovery)));
+        assert!(matches!(snapshot.get(1, 1), Err(Error::NeedsRecovery)));
+        assert!(matches!(pending.get(1, 1), Err(Error::NeedsRecovery)));
+        assert!(matches!(
+            pending.apply(1, 1, fields(100)),
+            Err(Error::NeedsRecovery)
+        ));
+        assert!(matches!(pending.commit(), Err(Error::NeedsRecovery)));
+        assert!(matches!(other.checkpoint(), Err(Error::NeedsRecovery)));
+        return;
+    }
     let result = db.write(|tx| {
         tx.apply(1, 1, fields(11))?;
         tx.apply(1, 1, fields(12))?;
@@ -133,6 +158,25 @@ fn write_and_sync_errors_poison_the_handle_until_recovery() {
     ] {
         let dir = baseline();
         let output = child(&dir, "io", "EVEDB_IO_ERROR", point);
+        assert!(
+            output.status.success(),
+            "{point}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        verify(&dir, committed);
+    }
+}
+
+#[test]
+fn uncertain_commits_stop_all_connections_readers_and_pending_transactions() {
+    for (point, committed) in [
+        ("before-write", false),
+        ("partial-write", false),
+        ("before-sync", true),
+        ("after-sync", true),
+    ] {
+        let dir = baseline();
+        let output = child(&dir, "shared-io", "EVEDB_IO_ERROR", point);
         assert!(
             output.status.success(),
             "{point}: {}",

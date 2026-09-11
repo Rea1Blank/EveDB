@@ -343,6 +343,9 @@ pub struct ReadSnapshot {
     pin: Arc<SnapshotPin>,
 }
 impl ReadSnapshot {
+    pub(crate) fn state(&self) -> &Arc<ReadState> {
+        &self.pin.state
+    }
     /// Committed sequence captured by this snapshot.
     pub fn sequence(&self) -> u64 {
         self.pin.state.sequence()

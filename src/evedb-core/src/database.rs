@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use crate::{
-    Entity, Error, Event, EventKind, Fields, Result, Schema, Table, TableId,
+    Entity, Error, Event, EventKind, Fields, ReadSnapshot, Result, Schema, SharedDatabase, Table,
+    TableId,
     codec::{Decoder, Encoder},
     error::corrupt,
     model::*,
@@ -259,7 +260,7 @@ impl Database {
         Ok(db)
     }
 
-    fn ready(&self) -> Result<()> {
+    pub(crate) fn ready(&self) -> Result<()> {
         if self.state.poisoned.load(Ordering::Acquire) {
             Err(Error::NeedsRecovery)
         } else {
@@ -348,6 +349,13 @@ impl Database {
     }
     fn load(&self, table: TableId, id: u64) -> Result<Option<EntityData>> {
         self.state.load(table, id)
+    }
+    /// Transfers the directory owner into cloneable concurrent connections.
+    pub fn into_shared(self) -> SharedDatabase {
+        SharedDatabase::from_database(self)
+    }
+    pub(crate) fn options(&self) -> Options {
+        self.options.clone()
     }
     /// Returns an independent, cloneable reader.
     pub fn reader(&self) -> crate::Reader {
@@ -639,7 +647,9 @@ impl Database {
 
 /// A staged transaction. Any failed write operation prevents its commit.
 pub struct Transaction<'a> {
-    db: &'a mut Database,
+    target: CommitTarget<'a>,
+    base: Arc<ReadState>,
+    options: Options,
     catalog: BTreeMap<TableId, Table>,
     staged: BTreeMap<(TableId, u64), EntityData>,
     operations: Vec<Operation>,
@@ -649,7 +659,9 @@ impl<'a> Transaction<'a> {
     fn new(db: &'a mut Database) -> Self {
         Self {
             catalog: (*db.state.catalog).clone(),
-            db,
+            base: db.state.clone(),
+            options: db.options.clone(),
+            target: CommitTarget::Local(db),
             staged: BTreeMap::new(),
             operations: Vec::new(),
             failed: false,
@@ -714,14 +726,15 @@ impl<'a> Transaction<'a> {
     }
     /// Reads current state including this transaction's own changes.
     pub fn get(&self, table: TableId, id: u64) -> Result<Option<Entity>> {
+        self.base.ready()?;
         self.table(table)?;
         if let Some(data) = self.staged.get(&(table, id)) {
             return Ok((!data.current.deleted).then(|| data.current.clone()));
         }
-        if !self.db.state.catalog.contains_key(&table) {
+        if !self.base.catalog.contains_key(&table) {
             return Ok(None);
         }
-        self.db.get(table, id)
+        self.base.get(table, id)
     }
     fn table(&self, id: TableId) -> Result<&Table> {
         self.catalog
@@ -738,7 +751,7 @@ impl<'a> Transaction<'a> {
         }
     }
     fn maintain(&mut self, table: TableId, id: u64) -> Result<()> {
-        let interval = self.db.options.snapshot_interval;
+        let interval = self.options.snapshot_interval;
         if interval != 0
             && self.staged[&(table, id)]
                 .current
@@ -747,12 +760,13 @@ impl<'a> Transaction<'a> {
         {
             self.snapshot(table, id)?;
         }
-        if let Some(count) = self.db.options.retain_events {
+        if let Some(count) = self.options.retain_events {
             self.retain_last(table, id, count)?;
         }
         Ok(())
     }
     fn run(&mut self, operation: Operation) -> Result<()> {
+        self.base.ready()?;
         if self.failed {
             return Err(Error::Invalid(
                 "transaction was aborted by an earlier operation".into(),
@@ -776,8 +790,8 @@ impl<'a> Transaction<'a> {
         let table = self.table(table_id)?.clone();
         let existing = if let Some(data) = self.staged.get(&(table_id, id)) {
             Some(data.clone())
-        } else if self.db.state.catalog.contains_key(&table_id) {
-            self.db.load(table_id, id)?
+        } else if self.base.catalog.contains_key(&table_id) {
+            self.base.load(table_id, id)?
         } else {
             None
         };
@@ -822,7 +836,7 @@ impl<'a> Transaction<'a> {
                             version: data.current.version.checked_add(1).ok_or_else(|| {
                                 Error::Invalid("entity versions exhausted".into())
                             })?,
-                            transaction: self.db.state.lsn.checked_add(1).ok_or_else(|| {
+                            transaction: self.base.lsn.checked_add(1).ok_or_else(|| {
                                 Error::Invalid("transaction sequence exhausted".into())
                             })?,
                             schema_version: table.schema().version,
@@ -852,49 +866,128 @@ impl<'a> Transaction<'a> {
         self.staged.insert((table_id, id), data);
         Ok(())
     }
-    /// Flushes one atomic WAL transaction and publishes all staged changes.
-    ///
-    /// On an I/O error during writing or synchronization, the outcome is unknown:
-    /// this database handle refuses further operations until it is reopened.
+    /// Commits the staged transaction. Shared writers validate dependencies first.
+    /// An I/O error after WAL writing starts has an unknown outcome and requires
+    /// recovery; a conflict is a definite abort and permits a whole-transaction retry.
     pub fn commit(self) -> Result<u64> {
+        self.base.ready()?;
         if self.failed {
             return Err(Error::Invalid(
                 "cannot commit an aborted transaction".into(),
             ));
         }
-        if self.operations.is_empty() {
-            return Ok(self.db.state.lsn);
+        let batch = Prepared {
+            base_sequence: self.base.lsn,
+            catalog: self.catalog,
+            staged: self.staged,
+            operations: self.operations,
+        };
+        match self.target {
+            CommitTarget::Local(db) => batch.commit(db),
+            CommitTarget::Shared { db, pin } => db.commit(batch, pin),
         }
-        let lsn = self
-            .db
+    }
+    fn publish(self, lsn: u64) {
+        // Recovery uses local staging without appending the WAL a second time.
+        let CommitTarget::Local(db) = self.target else {
+            unreachable!("local recovery")
+        };
+        Prepared {
+            base_sequence: self.base.lsn,
+            catalog: self.catalog,
+            staged: self.staged,
+            operations: self.operations,
+        }
+        .publish(db, lsn);
+    }
+}
+impl Transaction<'static> {
+    pub(crate) fn shared(db: SharedDatabase, pin: ReadSnapshot, options: Options) -> Self {
+        let base = pin.state().clone();
+        Self {
+            catalog: (*base.catalog).clone(),
+            base,
+            options,
+            target: CommitTarget::Shared { db, pin },
+            staged: BTreeMap::new(),
+            operations: Vec::new(),
+            failed: false,
+        }
+    }
+}
+enum CommitTarget<'a> {
+    Local(&'a mut Database),
+    Shared {
+        db: SharedDatabase,
+        pin: ReadSnapshot,
+    },
+}
+pub(crate) struct Prepared {
+    pub base_sequence: u64,
+    catalog: BTreeMap<TableId, Table>,
+    staged: BTreeMap<(TableId, u64), EntityData>,
+    operations: Vec<Operation>,
+}
+impl Prepared {
+    pub fn keys(&self) -> impl Iterator<Item = (TableId, u64)> + '_ {
+        self.staged.keys().copied()
+    }
+    pub fn changes_catalog(&self) -> bool {
+        self.operations
+            .iter()
+            .any(|op| matches!(op, Operation::Table(_)))
+    }
+    pub fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+    pub fn commit(mut self, db: &mut Database) -> Result<u64> {
+        db.ready()?;
+        if self.operations.is_empty() {
+            return Ok(db.state.lsn);
+        }
+        if db.wal.metadata()?.len() >= db.options.checkpoint_bytes
+            && db.state.lsn > db.state.root.lsn
+        {
+            db.checkpoint()?;
+        }
+        let lsn = db
             .state
             .lsn
             .checked_add(1)
             .ok_or_else(|| Error::Invalid("transaction sequence exhausted".into()))?;
+        // Transaction start order is independent of commit order. Only newly
+        // staged events get the final sequence; retained committed events keep theirs.
+        for data in self.staged.values_mut() {
+            for event in &mut data.events {
+                if event.transaction > self.base_sequence {
+                    event.transaction = lsn;
+                }
+            }
+        }
         let encoded = frame::encode(2, lsn, &encode_ops(&self.operations))?;
         fault("wal-before-write");
         let result = (|| -> std::io::Result<()> {
             io_fault("before-write")?;
-            self.db.wal.write_all(&encoded[..encoded.len() / 2])?;
+            db.wal.write_all(&encoded[..encoded.len() / 2])?;
             io_fault("partial-write")?;
             fault("wal-partial");
-            self.db.wal.write_all(&encoded[encoded.len() / 2..])?;
+            db.wal.write_all(&encoded[encoded.len() / 2..])?;
             io_fault("before-sync")?;
             fault("wal-written");
-            self.db.wal.sync_all()?;
+            db.wal.sync_all()?;
             io_fault("after-sync")?;
             fault("wal-synced");
             Ok(())
         })();
-        if let Err(e) = result {
-            self.db.state.poisoned.store(true, Ordering::Release);
-            return Err(Error::CommitUnknown(e));
+        if let Err(error) = result {
+            db.state.poisoned.store(true, Ordering::Release);
+            return Err(Error::CommitUnknown(error));
         }
-        self.publish(lsn);
+        self.publish(db, lsn);
         Ok(lsn)
     }
-    fn publish(self, lsn: u64) {
-        let state = Arc::make_mut(&mut self.db.state);
+    fn publish(self, db: &mut Database, lsn: u64) {
+        let state = Arc::make_mut(&mut db.state);
         state.catalog = Arc::new(self.catalog);
         state.overlay.extend(
             self.staged
@@ -902,7 +995,7 @@ impl<'a> Transaction<'a> {
                 .map(|(key, data)| (key, Arc::new(data))),
         );
         state.lsn = lsn;
-        self.db.readers.publish(self.db.state.clone());
+        db.readers.publish(db.state.clone());
     }
 }
 

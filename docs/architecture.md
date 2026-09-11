@@ -23,6 +23,7 @@ The core modules have the following responsibilities:
 | `model` | Typed schemas, entities, events, version reconstruction, retention |
 | `database` | Public API, transaction staging, WAL recovery, checkpoint publication |
 | `reader` | Immutable committed views, cloneable readers, snapshot pins and retention statistics |
+| `shared` | Cloneable connections, isolation options, write conflicts and ordered commit coordination |
 | `snapshot` | Generation manifests, slot addressing, occupancy counts, table readers/writers, indexed historical reads, compression |
 | `storage/page` | Checked 8 KiB slotted-page format |
 | `storage/pager` | Bounded cache of decoded pages and open checkpoint files |
@@ -31,7 +32,9 @@ The core modules have the following responsibilities:
 | `storage/frame` | Bounded checksummed WAL/event/catalog frames |
 | `codec`, `checksum`, `error` | Explicit byte encodings, CRC32C, shared errors |
 
-One database handle owns the directory. Transactions exclusively borrow it,
+One database owner holds the directory. Local transactions borrow it exclusively;
+shared connections stage independently against pinned views and validate write
+dependencies under a commit coordinator. Transactions
 stage changes, synchronize one complete WAL frame, then publish all changes
 together. Current reads combine the recent in-memory overlay with immutable
 checkpoint files. Historical reads seek through snapshot and event indexes;

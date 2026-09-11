@@ -15,7 +15,9 @@ entity lifecycle, transactions, and history retention.
 tables, atomic cross-table transactions, indexed current/history reads, replay,
 snapshots, retention, incremental checkpoints that collect the generations they
 outgrow, WAL/checkpoint recovery, and concurrent readers with pinned snapshots.
-The server and network API
+Cloneable connections support independently staged Snapshot write transactions
+with conflict detection and an explicit isolation API. See
+[concurrent transactions](docs/transactions.md). The server and network API
 remain future work. Disk formats are not stable or production-qualified. See the
 [storage design and limits](docs/storage.md). [ROADMAP.md](ROADMAP.md) records
 the architectural decisions behind that engine and what comes next.
