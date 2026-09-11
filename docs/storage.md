@@ -329,7 +329,11 @@ generation is collected once it falls below the live-ratio threshold, that the
 generation budget bounds a manifest across many checkpoints, that a collection
 larger than its budget is spread over several checkpoints without losing an
 entity, and that damage to a file shared by two manifests is reported instead of
-silently repaired. A historical-read test damages an early event after opening and
+silently repaired. A churn test updates a random subset of 200 entities over 80
+checkpoints and asserts that every entity still reads back, that the manifest
+stays within its generation budget, that the directory settles instead of growing
+with the number of checkpoints, and that a full pass then reclaims what the
+bounded collections had not reached. A historical-read test damages an early event after opening and
 confirms that a late snapshot read succeeds while explicit replay detects damage.
 
 With the `fault-injection` feature, subprocess tests stop the writer before,

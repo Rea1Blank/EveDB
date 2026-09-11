@@ -527,6 +527,82 @@ fn collection_is_spread_over_checkpoints_when_it_exceeds_its_budget() {
 }
 
 #[test]
+fn churn_keeps_every_entity_readable_and_the_database_bounded() {
+    let dir = TestDir::new();
+    let mut db = Database::open(&dir.0).unwrap();
+    let table = db.create_table("items", schema()).unwrap();
+    let entities = 200u64;
+    db.write(|tx| {
+        for id in 1..=entities {
+            tx.create(table, id, fields(0))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.compact().unwrap();
+    db.compact().unwrap();
+    let mut expected = vec![0i64; entities as usize + 1];
+    let mut random = 12345u64;
+    let mut halfway = 0;
+    for round in 1..=80i64 {
+        for _ in 0..20 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let id = random % entities + 1;
+            db.apply(table, id, fields(round)).unwrap();
+            expected[id as usize] = round;
+        }
+        db.checkpoint().unwrap();
+        assert!(db.generations().len() <= Options::default().max_generations);
+        if round == 40 {
+            halfway = size(&dir.0);
+        }
+    }
+    // Every entity reads back, whichever generation now holds it.
+    for id in 1..=entities {
+        assert_eq!(
+            db.get(table, id).unwrap().unwrap().fields[&1],
+            Value::Int64(expected[id as usize])
+        );
+    }
+    // Superseded records are reclaimed as generations are collected, so churn
+    // settles instead of growing with the number of checkpoints. The steady
+    // state is larger than a compacted database: it carries the superseded
+    // records a collection has not reached yet, and every referenced generation
+    // costs at least a few pages per table.
+    let churned = size(&dir.0);
+    assert!(
+        churned < halfway * 3 / 2,
+        "{churned} bytes after 80 rounds against {halfway} after 40"
+    );
+    drop(db);
+    let mut db = Database::open(&dir.0).unwrap();
+    db.compact().unwrap();
+    db.compact().unwrap();
+    assert_eq!(db.generations().len(), 1);
+    // A full pass reclaims what the bounded collections had not reached.
+    assert!(size(&dir.0) < churned);
+    for id in 1..=entities {
+        assert_eq!(
+            db.get(table, id).unwrap().unwrap().fields[&1],
+            Value::Int64(expected[id as usize])
+        );
+    }
+}
+
+fn size(path: &std::path::Path) -> u64 {
+    let mut total = 0;
+    for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        total += if entry.file_type().unwrap().is_dir() {
+            size(&entry.path())
+        } else {
+            entry.metadata().unwrap().len()
+        };
+    }
+    total
+}
+
+#[test]
 fn the_generation_budget_bounds_a_manifest() {
     let dir = TestDir::new();
     let mut db = Database::open_with_options(
