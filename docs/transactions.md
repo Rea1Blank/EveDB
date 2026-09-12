@@ -71,13 +71,14 @@ snapshots are gone. Snapshots can retain history the latest view has pruned.
 This is the concurrency foundation, not throughput or production qualification:
 
 - Shared commits use a bounded count/byte queue and can share one WAL sync.
-  Maintenance remains synchronous under coordination.
+  Shared maintenance captures/publishes under coordination and builds/reclaims
+  outside it. One background job is admitted; uncheckpointed WAL is bounded.
 - Publication shares overlay paths and unchanged catalogs. Ordinary staging
   reads current/base state; committed event payloads and disk history are shared.
 - Transaction/snapshot limits, monotonic deadlines and abandoned-handle expiry
   are implemented. Byte accounting covers accepted encoded mutations, not RSS.
 - ReadCommitted, Serializable, network sessions, durable request outcomes,
-  background maintenance and sustained throughput qualification remain pending.
+  and sustained throughput qualification remain pending.
 
 See [the write path](write-path.md) for the exact budgets, queue semantics,
 independent history format, regression tests and remaining costs.

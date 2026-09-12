@@ -50,12 +50,12 @@ rename keeps the table ID and physical identity.
 
 ```text
 data/
-  control                              format marker EVEDB003
+  control                              format marker EVEDB004
   LOCK                                 exclusive OS lock
   catalog/
     <generation>.catalog               schemas, file sizes and CRC32C checksums
   wal/
-    <generation>.wal                   checkpoint root, then transaction frames
+    <generation>.wal                   root header, transactions, checkpoint publications
   tables/
     <table-id>/<generation>/
       current.pages                    latest entity states and tombstones
@@ -84,7 +84,7 @@ absolute generation number; event locations pack a 16-bit segment and 48-bit byt
 offset, while snapshot locations carry a raw heap locator. The manifest records
 historical page sequences independently of current-state generation slots.
 Ordinary checkpoints copy index references and append new payloads. They do not
-rewrite old event payloads when a current record moves. EVEDB003 rejects older
+rewrite old event payloads when a current record moves. EVEDB004 rejects older
 control formats explicitly; no automatic migration or data deletion is performed.
 
 Current rows use an 8 KiB slotted heap and a separate B+tree primary index. The
@@ -167,14 +167,16 @@ outcome. A checkpoint failure after publication starts also requires recovery.
 
 Checkpointing proceeds as follows:
 
-1. Reserve a new generation and choose which referenced generations to collect.
+1. Reserve a generation, freeze the committed frontier and rotate WAL with a
+   header referencing the previous root. New transactions use the new segment.
 2. Write changed/collected current states and bases; carry untouched records.
    Rebuild primary/history/snapshot indexes, reuse referenced immutable history
    files, and append only new events and acceleration snapshots.
 3. Synchronize the files and write a checked catalog/manifest listing the files
    of every referenced generation with their sizes and whole-file checksums.
-4. Create a new WAL segment whose first frame contains that complete root;
-   synchronize it before publishing the new generation in memory.
+4. Append the complete root to the active WAL and synchronize it. Publish the
+   frozen frontier with the independently tracked overlay of later commits.
+   Shared builders and cleanup run outside the commit coordinator.
 5. Retain the preceding usable checkpoint and the WAL needed to replay from it.
    Delete every file that neither those manifests nor live snapshots name.
 
@@ -185,12 +187,13 @@ pins (clones share one) and unique referenced checkpoint bytes, including files
 also used by the current view. Uncertain storage failures stop data operations
 on all readers, including older snapshots.
 
-The WAL's initial root frame is the publication record; the catalog file is a
+Root frames publish checkpoints; a rotation header may repeat the preceding
+root. A segment number can exceed its initial root generation. The catalog is a
 separate copy. Recovery enumerates WAL roots, verifies checkpoint files, selects
 the newest usable checkpoint, and replays subsequent complete transaction frames
 in strict sequence. A damaged latest checkpoint can be rebuilt from the retained
 preceding checkpoint and WAL. Incomplete checkpoint headers are unpublished
-orphans. Only an incomplete transaction tail of the active WAL is truncated;
+orphans. Only an incomplete frame tail of the active WAL is truncated;
 complete corrupt frames and incomplete sealed transaction tails produce errors.
 Checksums detect damage; recovery requires an intact baseline and log.
 
@@ -221,7 +224,7 @@ survive independently; unreferenced files can be reclaimed on publication. The p
 published manifest, so a generation that loses density during one checkpoint is
 collected by the next.
 
-Collection happens inside the checkpoint, so its cost is a pause. `collect_entities`
+Collection is part of checkpoint construction, outside shared commit coordination. `collect_entities`
 caps how many entities one checkpoint copies for collection, and a generation too
 large to drain at once keeps its slot and is drained across several checkpoints;
 an entity that moves is simply written earlier than the rest of its generation,
@@ -257,7 +260,7 @@ compaction rewrites its live records. This is not secure erasure.
 | Setting or bound | Value |
 | --- | --- |
 | Heap/index page size | 8192 bytes |
-| Automatic checkpoint target | 8 MiB of active WAL, checked before the next transaction |
+| Automatic checkpoint target | 8 MiB of transaction WAL; shared maintenance is scheduled after commits |
 | History segment target | 8 MiB; one event may exceed the target |
 | Automatic snapshot interval | Every 32 entity versions; zero disables it |
 | Automatic retention | Disabled (`None`); retain all events |
@@ -281,11 +284,11 @@ OS caches, storage-controller caches, or arbitrary sector tearing. Failed first
 initialization can leave a directory needing manual inspection before reuse.
 Use disposable data while these guarantees and formats mature.
 
-Checkpoints remain synchronous. Primary/history/snapshot indexes are rebuilt in
-full; event payload copying has been removed, but index construction still scales
-with the number of indexed records. Partitioned indexes and background maintenance
-remain separate work. Startup verifies every referenced file's checksum. Explicit
-compaction may rewrite all live history and can pause writers for substantial I/O.
+Shared checkpoints and compaction build on a worker or the explicit caller
+without holding commit coordination. Local Database maintenance is synchronous.
+Primary/history/snapshot indexes still rebuild in full; partitioning is the next
+stage. Startup verifies every referenced file checksum. Publication still requires
+a WAL sync, and builders compete with writers for disk bandwidth.
 Current-state density is counted in entities rather than bytes.
 
 A bounded cache holds decoded checkpoint pages and open descriptors; because a
@@ -301,14 +304,19 @@ leaf before building parent levels, so its memory also grows with index size.
 `events` returns an allocated vector. Large histories can therefore be expensive
 despite indexed historical reads.
 
-Collection runs inside the checkpoint that publishes next, on the thread that
-writes, and `collect_entities` is what bounds that pause. Nothing runs in the
-background. Independent readers keep serving pinned views while collection
-runs. Background collection still needs a captured frontier and publication
-protocol that preserves writes arriving after that frontier.
+At most one shared maintenance job runs. `checkpoint_background(compact)`
+coalesces overlapping requests; `wait_for_maintenance()` reports completion or
+failure. Explicit checkpoint/compact waits outside commit coordination. A failed
+automatic job stops automatic retries until explicit maintenance succeeds.
+`max_uncheckpointed_wal_bytes` (512 MiB) rejects transaction WAL growth before
+I/O while maintenance falls behind. This counts transaction frames beyond the
+last completed frontier, excluding manifest headers and the retained recovery
+baseline. Recovery admits already acknowledged data regardless of this limit.
+Overlay history owners keep their file references and mutation reservations
+alive across publication; unused overlay trees are destroyed outside coordination.
 
 There is no server protocol, SQL/query planner, secondary field index, online
-backup/archive format, background maintenance, table drop, or schema migration
+backup/archive format, table drop, or schema migration
 with type changes in this slice. Page-size/clustered-tree/LSM alternatives and
 production compression remain benchmark decisions. We have not established that
 8 KiB or heap-plus-index is optimal. See [measurements](storage-benchmarks.md).

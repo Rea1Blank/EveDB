@@ -17,6 +17,7 @@ mod error;
 mod history;
 mod model;
 mod ordered_map;
+mod overlay;
 mod reader;
 mod resources;
 mod shared;

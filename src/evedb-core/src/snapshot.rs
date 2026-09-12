@@ -549,6 +549,7 @@ impl Root {
             return Err(corrupt("invalid current/base reference"));
         }
         Ok(Some(EntityData {
+            charges: crate::ordered_map::OrderedMap::new(),
             disk: Some(Arc::new(crate::history::DiskHistory {
                 root: self.clone(),
                 pager: pager.clone(),

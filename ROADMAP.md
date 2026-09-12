@@ -141,3 +141,10 @@ These support the isolation/WAL distinctions; EveDB's architecture is our choice
 - [SET TRANSACTION](https://www.postgresql.org/docs/18/sql-set-transaction.html): explicit levels and per-command snapshots.
 - [RocksDB WAL performance](https://github.com/facebook/rocksdb/wiki/WAL-Performance): sharing synchronization.
 - [RocksDB unordered writes](https://github.com/facebook/rocksdb/wiki/unordered_write): publication and snapshot protocols.
+
+## Next maintenance series
+
+See [maintenance and bounded reads](docs/maintenance-series.md) and issue #18.
+Stage 1 implements background shared checkpoint/compaction with a frozen WAL
+frontier, bounded job admission, and an uncheckpointed transaction-WAL limit.
+Stages 2 (partitioned indexes) and 3 (bounded streaming reads) follow separately.

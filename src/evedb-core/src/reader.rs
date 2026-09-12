@@ -27,7 +27,8 @@ pub(crate) struct ReadState {
     pub root: Arc<Root>,
     pub pinned_bytes: Option<usize>,
     pub catalog: Arc<BTreeMap<TableId, Table>>,
-    pub overlay: OrderedMap<(TableId, u64), Arc<EntityData>>,
+    pub overlay: crate::overlay::Overlay,
+    pub root_bytes: Option<usize>,
     pub lsn: u64,
     pub resources: Arc<Resources>,
     pub charges: OrderedMap<u64, Arc<Reservation>>,
@@ -46,13 +47,19 @@ impl Drop for DirectoryLock {
 }
 impl ReadState {
     pub fn refresh_pinned_bytes(&mut self) {
-        let bytes = self.file_sizes().try_fold(0usize, |sum, (_, size)| {
+        let bytes = self.root.file_sizes().try_fold(0usize, |sum, (_, size)| {
             sum.checked_add(usize::try_from(size).ok()?)
         });
-        self.pinned_bytes = bytes;
+        self.root_bytes = bytes;
+        self.refresh_overlay_bytes();
+    }
+    pub fn refresh_overlay_bytes(&mut self) {
+        self.pinned_bytes = self
+            .root_bytes
+            .and_then(|n| n.checked_add(self.overlay.bytes));
     }
     pub fn file_sizes(&self) -> impl Iterator<Item = (FileId, u64)> + '_ {
-        self.root.file_sizes()
+        self.root.file_sizes().chain(self.overlay.file_sizes())
     }
     pub(crate) fn ready(&self) -> Result<()> {
         if self.poisoned.load(Ordering::Acquire) {

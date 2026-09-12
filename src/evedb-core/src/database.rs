@@ -117,6 +117,9 @@ pub struct GenerationStats {
 pub struct Database {
     directory: PathBuf,
     wal: File,
+    pub(crate) shared_mode: bool,
+    checkpoint_tail: Option<crate::overlay::Overlay>,
+    wal_bytes: u64,
     #[cfg(test)]
     pub(crate) wal_syncs: usize,
     state: Arc<ReadState>,
@@ -168,7 +171,7 @@ impl Database {
         if !directory.join("control").exists() {
             initialize(&directory)?;
         }
-        if fs::read(directory.join("control"))? != b"EVEDB003" {
+        if fs::read(directory.join("control"))? != b"EVEDB004" {
             return Err(corrupt("unsupported database control format"));
         }
         let segments = numbered_files(&directory.join("wal"), "wal")?;
@@ -176,20 +179,29 @@ impl Database {
             return Err(corrupt("missing recovery WAL"));
         }
         let mut roots = Vec::new();
+        let mut active_generation = None;
         for &(number, ref path) in &segments {
             let mut file = File::open(path)?;
-            match frame::read(&mut file)? {
-                Some(frame) if frame.kind == 1 => {
-                    let root = Root::decode(&frame.payload)?;
-                    if root.generation != number || root.lsn != frame.lsn {
+            let mut first = true;
+            while let Some(record) = frame::read(&mut file)? {
+                if first && record.kind != 1 {
+                    return Err(corrupt("WAL segment lacks its checkpoint header"));
+                }
+                first = false;
+                active_generation = Some(number);
+                if record.kind == 1 {
+                    let root = Root::decode(&record.payload)?;
+                    if root.generation > number || root.lsn != record.lsn {
                         return Err(corrupt("checkpoint/WAL identity mismatch"));
                     }
                     roots.push(root);
+                } else if record.kind != 2 {
+                    return Err(corrupt("unexpected WAL record"));
                 }
-                None => {}
-                _ => return Err(corrupt("WAL segment lacks its checkpoint header")),
             }
         }
+        roots.sort_by_key(|root| root.generation);
+        roots.dedup_by_key(|root| root.generation);
         let pager = Pager::new(
             directory.clone(),
             options.cache_bytes,
@@ -208,10 +220,7 @@ impl Database {
         }
         let root = selected
             .ok_or_else(|| last_error.unwrap_or_else(|| corrupt("no complete checkpoint")))?;
-        let active_generation = roots
-            .last()
-            .ok_or_else(|| corrupt("missing active WAL"))?
-            .generation;
+        let active_generation = active_generation.ok_or_else(|| corrupt("missing active WAL"))?;
         let wal_path = directory
             .join("wal")
             .join(format!("{active_generation:020}.wal"));
@@ -224,7 +233,8 @@ impl Database {
             catalog: Arc::new(root.catalog.clone()),
             lsn: root.lsn,
             root: Arc::new(root),
-            overlay: OrderedMap::new(),
+            overlay: crate::overlay::Overlay::new(),
+            root_bytes: Some(0),
             pinned_bytes: Some(0),
             resources: Resources::new(options.limits.clone(), options.timeouts.clone())?,
             charges: OrderedMap::new(),
@@ -237,6 +247,9 @@ impl Database {
         let mut db = Self {
             directory,
             wal,
+            shared_mode: false,
+            checkpoint_tail: None,
+            wal_bytes: 0,
             #[cfg(test)]
             wal_syncs: 0,
             readers: Arc::new(ReaderShared::new(state.clone())),
@@ -258,6 +271,10 @@ impl Database {
             }
             let mut complete_end = file.stream_position()?;
             while let Some(record) = frame::read(&mut file)? {
+                if record.kind == 1 {
+                    complete_end = file.stream_position()?;
+                    continue;
+                }
                 if record.kind != 2 {
                     return Err(corrupt("unexpected record in transaction WAL"));
                 }
@@ -272,6 +289,9 @@ impl Database {
                             .map_err(|e| corrupt(format!("invalid WAL operation: {e}")))?;
                     }
                     tx.publish(record.lsn)?;
+                    db.wal_bytes = db
+                        .wal_bytes
+                        .saturating_add(40 + record.payload.len() as u64);
                 }
                 complete_end = file.stream_position()?;
             }
@@ -393,9 +413,6 @@ impl Database {
     /// Visits live entities in ID order using one committed view.
     pub fn scan(&self, table: TableId, visit: impl FnMut(Entity) -> Result<()>) -> Result<()> {
         self.reader().scan(table, visit)
-    }
-    fn load(&self, table: TableId, id: u64) -> Result<Option<EntityData>> {
-        self.state.load(table, id)
     }
     /// Transfers the directory owner into cloneable concurrent connections.
     pub fn into_shared(self) -> SharedDatabase {
@@ -520,16 +537,148 @@ impl Database {
         plan
     }
     fn publish(&mut self, plan: BTreeMap<u64, u64>, rewrite_history: bool) -> Result<()> {
+        let job = self.prepare_checkpoint(plan, rewrite_history)?;
+        let generation = job.generation;
+        match job.build() {
+            Ok(root) => {
+                let cleanup = self.install_checkpoint(root)?;
+                cleanup.run()
+            }
+            Err(error) => {
+                self.abandon_checkpoint(generation);
+                Err(error)
+            }
+        }
+    }
+    pub(crate) fn maintenance_due(&self) -> bool {
+        self.wal_bytes >= self.options.checkpoint_bytes && self.state.lsn > self.state.root.lsn
+    }
+    pub(crate) fn capture_checkpoint(&mut self, compact: bool) -> Result<CheckpointJob> {
+        let plan = if compact {
+            self.state
+                .root
+                .generations
+                .iter()
+                .map(|g| (g.generation, u64::MAX))
+                .collect()
+        } else {
+            self.collection_plan()
+        };
+        let rewrite = compact
+            && (!self.state.root.history_compacted
+                || self.state.overlay.range(..).next().is_some());
+        self.prepare_checkpoint(plan, rewrite)
+    }
+    fn prepare_checkpoint(
+        &mut self,
+        plan: BTreeMap<u64, u64>,
+        rewrite_history: bool,
+    ) -> Result<CheckpointJob> {
         self.ready()?;
+        if self.checkpoint_tail.is_some() {
+            return Err(Error::Invalid("maintenance already running".into()));
+        }
         let generation = self.next_generation;
         self.next_generation = generation
             .checked_add(1)
             .ok_or_else(|| Error::Invalid("generation exhausted".into()))?;
-        let catalog_path = self
+        let catalog_file = File::create_new(
+            self.directory
+                .join("catalog")
+                .join(format!("{generation:020}.catalog")),
+        )?;
+        let path = self
             .directory
-            .join("catalog")
-            .join(format!("{generation:020}.catalog"));
-        let mut catalog_file = File::create_new(catalog_path)?;
+            .join("wal")
+            .join(format!("{generation:020}.wal"));
+        let mut wal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        let rotation = (|| -> Result<()> {
+            frame::append(&mut wal, 1, self.state.root.lsn, &self.state.root.encode())?;
+            wal.sync_all()?;
+            snapshot::sync_directory(&self.directory.join("wal"))?;
+            Ok(())
+        })();
+        if let Err(error) = rotation {
+            self.state.poisoned.store(true, Ordering::Release);
+            return Err(error);
+        }
+        self.wal = wal;
+        self.checkpoint_tail = Some(crate::overlay::Overlay::new());
+        Ok(CheckpointJob {
+            directory: self.directory.clone(),
+            options: self.options.clone(),
+            state: self.state.clone(),
+            generation,
+            plan,
+            rewrite_history,
+            catalog_file,
+            wal_frontier_bytes: self.wal_bytes,
+        })
+    }
+    pub(crate) fn abandon_checkpoint(&mut self, _generation: u64) {
+        self.checkpoint_tail = None;
+    }
+    pub(crate) fn install_checkpoint(&mut self, built: BuiltCheckpoint) -> Result<Cleanup> {
+        self.ready()?;
+        let root = built.root;
+        let encoded = frame::encode(1, root.lsn, &root.encode())?;
+        let publication = (|| -> Result<()> {
+            self.wal.write_all(&encoded[..encoded.len() / 2])?;
+            fault("checkpoint-wal-partial");
+            self.wal.write_all(&encoded[encoded.len() / 2..])?;
+            self.wal.sync_all()?;
+            fault("checkpoint-published");
+            Ok(())
+        })();
+        if let Err(error) = publication {
+            self.state.poisoned.store(true, Ordering::Release);
+            return Err(error);
+        }
+        let retired = self.state.clone();
+        let state = Arc::make_mut(&mut self.state);
+        let previous = std::mem::replace(&mut state.root, Arc::new(root));
+        state.overlay = self.checkpoint_tail.take().expect("captured checkpoint");
+        if let Some(first) = state.root.lsn.checked_add(1) {
+            state.charges.retain_from(&first);
+        } else {
+            state.charges.clear();
+        }
+        state.refresh_pinned_bytes();
+        self.wal_bytes = self.wal_bytes.saturating_sub(built.wal_frontier_bytes);
+        self.readers.publish(self.state.clone());
+        Ok(Cleanup {
+            _retired: retired,
+            directory: self.directory.clone(),
+            previous,
+            state: self.state.clone(),
+            readers: self.readers.clone(),
+        })
+    }
+}
+
+pub(crate) struct CheckpointJob {
+    directory: PathBuf,
+    options: Options,
+    state: Arc<ReadState>,
+    pub generation: u64,
+    plan: BTreeMap<u64, u64>,
+    rewrite_history: bool,
+    catalog_file: File,
+    wal_frontier_bytes: u64,
+}
+pub(crate) struct BuiltCheckpoint {
+    root: Root,
+    wal_frontier_bytes: u64,
+}
+impl CheckpointJob {
+    pub fn build(mut self) -> Result<BuiltCheckpoint> {
+        let generation = self.generation;
+        let plan = &self.plan;
+        let rewrite_history = self.rewrite_history;
         // A generation the plan drains completely leaves the manifest; one it
         // drains partially keeps its slot and carries the quota into the pass.
         let absorb: BTreeSet<_> = plan
@@ -602,6 +751,7 @@ impl Database {
                     }
                 }
                 let data = self
+                    .state
                     .load(table, id)?
                     .ok_or_else(|| corrupt("entity vanished during checkpoint"))?;
                 writer.append(id, &data)
@@ -624,51 +774,33 @@ impl Database {
             self.options.limits.max_history_files,
         )?;
         let payload = root.encode();
-        frame::append(&mut catalog_file, 4, self.state.lsn, &payload)?;
-        catalog_file.sync_all()?;
+        frame::append(&mut self.catalog_file, 4, self.state.lsn, &payload)?;
+        self.catalog_file.sync_all()?;
         snapshot::sync_directory(&self.directory.join("catalog"))?;
         fault("checkpoint-catalog");
-        let path = self
-            .directory
-            .join("wal")
-            .join(format!("{generation:020}.wal"));
-        let mut wal = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-        let encoded = frame::encode(1, self.state.lsn, &payload)?;
-        // From this point a failed publication could be recovered as complete.
-        // Refuse further writes to the previous WAL until recovery resolves it.
-        let publication = (|| -> Result<()> {
-            wal.write_all(&encoded[..encoded.len() / 2])?;
-            fault("checkpoint-wal-partial");
-            wal.write_all(&encoded[encoded.len() / 2..])?;
-            wal.sync_all()?;
-            snapshot::sync_directory(&self.directory.join("wal"))?;
-            fault("checkpoint-published");
-            Ok(())
-        })();
-        if let Err(error) = publication {
-            self.state.poisoned.store(true, Ordering::Release);
-            return Err(error);
-        }
-        let state = Arc::make_mut(&mut self.state);
-        let previous = std::mem::replace(&mut state.root, Arc::new(root));
-        self.wal = wal;
-        Arc::make_mut(&mut self.state).overlay.clear();
-        Arc::make_mut(&mut self.state).refresh_pinned_bytes();
-        Arc::make_mut(&mut self.state).charges.clear();
-        self.readers.publish(self.state.clone());
-        // Publication succeeded: cleanup errors do not invalidate acknowledged commits.
-        let mut keep: BTreeSet<_> = previous
+        Ok(BuiltCheckpoint {
+            root,
+            wal_frontier_bytes: self.wal_frontier_bytes,
+        })
+    }
+}
+pub(crate) struct Cleanup {
+    _retired: Arc<ReadState>,
+    directory: PathBuf,
+    previous: Arc<Root>,
+    state: Arc<ReadState>,
+    readers: Arc<ReaderShared>,
+}
+impl Cleanup {
+    pub fn run(self) -> Result<()> {
+        let mut keep: BTreeSet<_> = self
+            .previous
             .file_ids()
-            .chain(self.state.root.file_ids())
+            .chain(self.state.file_sizes().map(|(file, _)| file))
             .collect();
         keep.extend(self.readers.pinned_files());
-        // Closing a descriptor before deleting its file also satisfies Windows.
         self.state.pager.forget(|file| !keep.contains(&file));
-        self.cleanup(previous.generation, &keep)?;
+        self.cleanup(self.previous.generation, &keep)?;
         fault("checkpoint-cleanup");
         Ok(())
     }
@@ -1069,6 +1201,7 @@ impl Staging {
                 fields,
             };
             let data = EntityData {
+                charges: OrderedMap::new(),
                 base: current.clone(),
                 current,
                 events: Vec::new(),
@@ -1167,7 +1300,8 @@ impl Prepared {
         let mut active: Vec<_> = batches.into_iter().enumerate().collect();
         let preparation = (|| -> Result<Vec<Vec<u8>>> {
             db.ready()?;
-            if db.wal.metadata()?.len() >= db.options.checkpoint_bytes
+            if !db.shared_mode
+                && db.wal.metadata()?.len() >= db.options.checkpoint_bytes
                 && db.state.lsn > db.state.root.lsn
             {
                 db.checkpoint()?;
@@ -1176,21 +1310,30 @@ impl Prepared {
             // was staged. Rebind to the now-durable equivalent before publishing;
             // conflict validation guarantees no intervening write to these keys.
             for (_, batch) in &mut active {
-                if batch.root_generation != db.state.root.generation {
-                    for (&(table, id), data) in &mut batch.staged {
-                        if let Some(persisted) = db.state.root.entity(&db.state.pager, table, id)? {
-                            let through = persisted.current.version;
-                            if let Some(first) = through.checked_add(1) {
-                                data.committed.retain_from(&first);
-                            } else {
-                                data.committed.clear();
-                            }
-                            data.snapshots.retain_from(&through);
-                            data.disk = persisted.disk;
+                for (&(table, id), data) in &mut batch.staged {
+                    if (batch.root_generation != db.state.root.generation
+                        || data
+                            .disk
+                            .as_ref()
+                            .is_some_and(|disk| disk.root.generation != db.state.root.generation))
+                        && let Some(persisted) = db.state.root.entity(&db.state.pager, table, id)?
+                    {
+                        let through = persisted.current.version;
+                        if let Some(first) = through.checked_add(1) {
+                            data.committed.retain_from(&first);
+                        } else {
+                            data.committed.clear();
+                        }
+                        data.snapshots.retain_from(&through);
+                        data.disk = persisted.disk;
+                        if let Some(first) = db.state.root.lsn.checked_add(1) {
+                            data.charges.retain_from(&first);
+                        } else {
+                            data.charges.clear();
                         }
                     }
-                    batch.root_generation = db.state.root.generation;
                 }
+                batch.root_generation = db.state.root.generation;
             }
             loop {
                 active.retain(|(index, batch)| {
@@ -1236,6 +1379,16 @@ impl Prepared {
                 return results.into_iter().map(Option::unwrap).collect();
             }
         };
+        let bytes = frames.iter().map(|frame| frame.len() as u64).sum::<u64>();
+        if db.wal_bytes.saturating_add(bytes) > db.options.limits.max_uncheckpointed_wal_bytes {
+            for (index, _) in active {
+                results[index] = Some(Err(Error::LimitExceeded {
+                    resource: "uncheckpointed WAL bytes",
+                    limit: db.options.limits.max_uncheckpointed_wal_bytes as usize,
+                }));
+            }
+            return results.into_iter().map(Option::unwrap).collect();
+        }
         if !frames.is_empty() {
             fault("wal-before-write");
             let write = (|| -> std::io::Result<()> {
@@ -1266,6 +1419,7 @@ impl Prepared {
                     ))));
                 }
             } else {
+                db.wal_bytes += bytes;
                 let first = db.state.lsn;
                 for (offset, (index, batch)) in active.into_iter().enumerate() {
                     let lsn = first + offset as u64 + 1;
@@ -1282,17 +1436,22 @@ impl Prepared {
         db.readers.publish(db.state.clone());
     }
     fn publish_state(mut self, db: &mut Database, lsn: u64) {
+        let reservation = Arc::new(self.reservation);
         for data in self.staged.values_mut() {
             data.seal();
+            data.charges.insert(lsn, reservation.clone());
         }
         let state = Arc::make_mut(&mut db.state);
-        state.charges.insert(lsn, Arc::new(self.reservation));
+        state.charges.insert(lsn, reservation);
         state.catalog = self.catalog;
-        state.overlay.extend(
-            self.staged
-                .into_iter()
-                .map(|(key, data)| (key, Arc::new(data))),
-        );
+        for (key, data) in self.staged {
+            let data = Arc::new(data);
+            if let Some(tail) = &mut db.checkpoint_tail {
+                tail.insert(key, data.clone());
+            }
+            state.overlay.insert(key, data);
+        }
+        state.refresh_overlay_bytes();
         state.lsn = lsn;
     }
 }
@@ -1468,7 +1627,7 @@ fn initialize(directory: &Path) -> Result<()> {
     frame::append(&mut wal, 1, 0, &payload)?;
     wal.sync_all()?;
     let mut control = File::create_new(directory.join("control"))?;
-    control.write_all(b"EVEDB003")?;
+    control.write_all(b"EVEDB004")?;
     control.sync_all()?;
     snapshot::sync_directory(&directory.join("catalog"))?;
     snapshot::sync_directory(&directory.join("wal"))?;

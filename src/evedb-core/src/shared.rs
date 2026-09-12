@@ -15,7 +15,7 @@ use crate::{
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 
 /// Isolation requested for a transaction. Unsupported levels are rejected.
@@ -99,15 +99,29 @@ struct Coordinator {
 /// Cloneable in-process database connection. Transactions stage independently.
 ///
 /// Readers and staging do not acquire the commit mutex. Only validation, WAL
-/// synchronization, publication, and synchronous maintenance use it. Network
-/// transport and background maintenance remain
-/// separate roadmap work. Use one owner per directory and clone its connections.
+/// synchronization and publication use it. Maintenance builds and cleanup run
+/// outside it. Network transport remains separate roadmap work. Use one owner per directory and clone its connections.
 #[derive(Clone)]
 pub struct SharedDatabase {
     coordinator: Arc<Mutex<Coordinator>>,
     queue: Arc<Queue>,
     reader: Reader,
     options: Arc<Options>,
+    maintenance: Arc<MaintenanceState>,
+}
+
+#[derive(Default)]
+struct MaintenanceState {
+    running: Mutex<bool>,
+    changed: Condvar,
+    error: Mutex<Option<Error>>,
+}
+struct MaintenanceGuard(Arc<MaintenanceState>);
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        *self.0.running.lock().expect("maintenance state") = false;
+        self.0.changed.notify_all();
+    }
 }
 impl SharedDatabase {
     /// Opens a concurrent database with default storage options.
@@ -118,8 +132,10 @@ impl SharedDatabase {
     pub fn open_with_options(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         Ok(Database::open_with_options(path, options)?.into_shared())
     }
-    pub(crate) fn from_database(database: Database) -> Self {
+    pub(crate) fn from_database(mut database: Database) -> Self {
+        database.shared_mode = true;
         Self {
+            maintenance: Arc::new(MaintenanceState::default()),
             queue: Arc::new(Queue::default()),
             reader: database.reader(),
             options: Arc::new(database.options()),
@@ -195,19 +211,131 @@ impl SharedDatabase {
     pub fn delete(&self, table: TableId, id: u64) -> Result<()> {
         self.write(|tx| tx.delete(table, id))
     }
-    /// Runs synchronous checkpoint work while independent readers continue.
+    /// Waits for a checkpoint built outside the commit coordinator.
     pub fn checkpoint(&self) -> Result<()> {
-        let mut coordinator = self.coordinator.lock().map_err(|_| Error::NeedsRecovery)?;
-        coordinator.database.checkpoint()?;
-        Self::prune_revisions(&mut coordinator);
-        Ok(())
+        self.maintain(false)
     }
     /// Compacts the database while preserving every live snapshot's files.
     pub fn compact(&self) -> Result<()> {
-        let mut coordinator = self.coordinator.lock().map_err(|_| Error::NeedsRecovery)?;
-        coordinator.database.compact()?;
-        Self::prune_revisions(&mut coordinator);
-        Ok(())
+        self.maintain(true)
+    }
+    /// Starts one background checkpoint or compaction; returns false if one is running.
+    pub fn checkpoint_background(&self, compact: bool) -> Result<bool> {
+        let mut running = self
+            .maintenance
+            .running
+            .lock()
+            .map_err(|_| Error::NeedsRecovery)?;
+        if *running {
+            return Ok(false);
+        }
+        *running = true;
+        let database = self.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("evedb-maintenance".into())
+            .spawn(move || {
+                let _guard = MaintenanceGuard(database.maintenance.clone());
+                let result = (|| {
+                    database.perform_maintenance(compact)?;
+                    while database
+                        .coordinator
+                        .lock()
+                        .map_err(|_| Error::NeedsRecovery)?
+                        .database
+                        .maintenance_due()
+                    {
+                        database.perform_maintenance(false)?;
+                    }
+                    Ok::<_, Error>(())
+                })();
+                *database
+                    .maintenance
+                    .error
+                    .lock()
+                    .expect("maintenance error") = result.err();
+            })
+        {
+            *running = false;
+            self.maintenance.changed.notify_all();
+            return Err(error.into());
+        }
+        Ok(true)
+    }
+    /// Waits for the current background job and reports its build/publication error.
+    pub fn wait_for_maintenance(&self) -> Result<()> {
+        let mut running = self
+            .maintenance
+            .running
+            .lock()
+            .map_err(|_| Error::NeedsRecovery)?;
+        while *running {
+            running = self
+                .maintenance
+                .changed
+                .wait(running)
+                .map_err(|_| Error::NeedsRecovery)?;
+        }
+        match self
+            .maintenance
+            .error
+            .lock()
+            .map_err(|_| Error::NeedsRecovery)?
+            .as_ref()
+        {
+            Some(error) => Err(error.duplicate()),
+            None => Ok(()),
+        }
+    }
+    fn maintain(&self, compact: bool) -> Result<()> {
+        let mut running = self
+            .maintenance
+            .running
+            .lock()
+            .map_err(|_| Error::NeedsRecovery)?;
+        while *running {
+            running = self
+                .maintenance
+                .changed
+                .wait(running)
+                .map_err(|_| Error::NeedsRecovery)?;
+        }
+        *running = true;
+        drop(running);
+        let _guard = MaintenanceGuard(self.maintenance.clone());
+        let result = self.perform_maintenance(compact);
+        *self
+            .maintenance
+            .error
+            .lock()
+            .map_err(|_| Error::NeedsRecovery)? = result.as_ref().err().map(Error::duplicate);
+        result
+    }
+    fn perform_maintenance(&self, compact: bool) -> Result<()> {
+        let job = self
+            .coordinator
+            .lock()
+            .map_err(|_| Error::NeedsRecovery)?
+            .database
+            .capture_checkpoint(compact)?;
+        let generation = job.generation;
+        let built = match job.build() {
+            Ok(built) => built,
+            Err(error) => {
+                self.coordinator
+                    .lock()
+                    .map_err(|_| Error::NeedsRecovery)?
+                    .database
+                    .abandon_checkpoint(generation);
+                return Err(error);
+            }
+        };
+        let cleanup = {
+            let mut coordinator = self.coordinator.lock().map_err(|_| Error::NeedsRecovery)?;
+            let cleanup = coordinator.database.install_checkpoint(built)?;
+            Self::prune_revisions(&mut coordinator);
+            cleanup
+        };
+        cleanup.run()
     }
     fn prune_revisions(coordinator: &mut Coordinator) {
         let oldest = coordinator
@@ -363,10 +491,22 @@ impl SharedDatabase {
         if coordinator.database.checkpoint_generation() != before {
             Self::prune_revisions(&mut coordinator);
         }
+        let maintenance_due = coordinator.database.maintenance_due();
         drop(coordinator);
         leadership.tickets.clear();
         leadership.armed = false;
         self.queue.finish(completed);
+        if maintenance_due
+            && self
+                .maintenance
+                .error
+                .lock()
+                .expect("maintenance error")
+                .is_none()
+            && let Err(error) = self.checkpoint_background(false)
+        {
+            *self.maintenance.error.lock().expect("maintenance error") = Some(error);
+        }
     }
 }
 // Hand leadership back even when coordination fails or unwinds. Claimed callers

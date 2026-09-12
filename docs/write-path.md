@@ -145,10 +145,10 @@ released segments, format rejection preserves user files, and the file budget
 fails before publication. Prefix trimming/floor queries are checked against an
 ordered model with tree balance and old-root invariants.
 
-Remaining costs are explicit: synchronous maintenance, full index rebuilds,
+Remaining costs are explicit: local synchronous maintenance, full index rebuilds,
 whole-file startup verification, caller-owned results and decoded-record memory.
 These changes remove major write amplification paths; they do not establish a
-production RPS claim. External metrics, load qualification, background maintenance,
+production RPS claim. External metrics, load qualification,
 network serving, additional isolation levels, backup/upgrades and platform
 power-loss qualification remain the subsequent roadmap work.
 

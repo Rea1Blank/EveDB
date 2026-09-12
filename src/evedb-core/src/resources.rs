@@ -28,6 +28,8 @@ pub struct Limits {
     /// History payload files (events and snapshots) in a newly published checkpoint.
     /// Reaching this bound requires compaction or explicit retention before checkpointing.
     pub max_history_files: usize,
+    /// Transaction WAL bytes after the last completed checkpoint frontier.
+    pub max_uncheckpointed_wal_bytes: u64,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -41,12 +43,14 @@ impl Default for Limits {
             max_queued_commits: 256,
             max_queued_commit_bytes: 128 * 1024 * 1024,
             max_history_files: 4096,
+            max_uncheckpointed_wal_bytes: 512 * 1024 * 1024,
         }
     }
 }
 impl Limits {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.max_transactions == 0
+        if self.max_uncheckpointed_wal_bytes == 0
+            || self.max_transactions == 0
             || self.max_history_files == 0
             || self.max_queued_commits == 0
             || self.max_queued_commit_bytes < self.max_transaction_bytes
