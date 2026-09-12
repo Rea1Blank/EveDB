@@ -171,7 +171,7 @@ impl Database {
         if !directory.join("control").exists() {
             initialize(&directory)?;
         }
-        if fs::read(directory.join("control"))? != b"EVEDB004" {
+        if fs::read(directory.join("control"))? != b"EVEDB005" {
             return Err(corrupt("unsupported database control format"));
         }
         let segments = numbered_files(&directory.join("wal"), "wal")?;
@@ -703,6 +703,7 @@ impl CheckpointJob {
             catalog: (*self.state.catalog).clone(),
             generations,
             files: self.state.root.kept_files(&absorb),
+            partitions: BTreeMap::new(),
             history_generations: BTreeMap::new(),
             history_compacted: rewrite_history
                 || (self.state.root.history_compacted
@@ -719,50 +720,93 @@ impl CheckpointJob {
                 self.options.history_segment_bytes,
                 self.options.compress_history,
                 rewrite_history,
+                self.options
+                    .limits
+                    .max_index_partitions
+                    .saturating_sub(root.partitions.len()),
+                plan.values().all(|&quota| quota == u64::MAX)
+                    && plan.len() == self.state.root.generations.len(),
             )?;
             let occupancy = &mut root.occupancy;
             let quotas = &mut quotas;
-            self.state.visit_entries(table, |id, locator| {
-                if let Some(value) = locator {
-                    let touched = self.state.overlay.contains_key(&(table, id));
-                    match slots[usize::from(snapshot::entity_slot(value)?)] {
-                        // The generation leaves the manifest, so every entity of
-                        // it moves and no counter outlives the move.
-                        None => {}
-                        Some(slot) => {
-                            let quota = &mut quotas[usize::from(slot)];
-                            if !touched && *quota == 0 {
-                                // Untouched, and its generation is not being
-                                // drained: the records stay where they are and
-                                // only the index entry moves.
-                                return writer.carry(
-                                    id,
-                                    snapshot::remap(value, slot),
-                                    &self.state.root,
-                                    &self.state.pager,
-                                );
-                            }
-                            if !touched {
-                                *quota -= 1;
-                            }
-                            // A rewritten entity leaves an unreachable copy behind.
-                            occupancy.entry((table, slot)).or_default().dead += 1;
-                        }
-                    }
+            let mut partitions: BTreeSet<_> = self
+                .state
+                .root
+                .partitions
+                .range((table, 3, [0, 0])..=(table, 3, [u64::MAX, u64::MAX]))
+                .map(|(route, _)| route.2[0])
+                .collect();
+            partitions.extend(
+                self.state
+                    .overlay
+                    .range((table, 0)..=(table, u64::MAX))
+                    .map(|(&(t, id), _)| {
+                        debug_assert_eq!(t, table);
+                        crate::partitions::bucket(3, [id, 0])[0]
+                    }),
+            );
+            for lower in partitions {
+                let upper = lower.saturating_add(crate::partitions::WIDTH - 1);
+                let route = (table, 3, [lower, 0]);
+                if let Some(part) = self.state.root.partitions.get(&route)
+                    && self
+                        .state
+                        .overlay
+                        .range((table, lower)..=(table, upper))
+                        .next()
+                        .is_none()
+                    && part.slots.values().all(|&slot| {
+                        slots[usize::from(slot)].is_some_and(|new| quotas[usize::from(new)] == 0)
+                    })
+                {
+                    writer.carry_partition(&self.state.root, route, &slots)?;
+                    writer.carry_partition_history(&self.state.root, lower, upper, &slots)?;
+                    continue;
                 }
-                let data = self
-                    .state
-                    .load(table, id)?
-                    .ok_or_else(|| corrupt("entity vanished during checkpoint"))?;
-                writer.append(id, &data)
-            })?;
-            let (files, entities, history_generations) = writer.finish()?;
-            root.history_generations.extend(history_generations);
-            root.files.extend(files);
+                self.state
+                    .visit_entries_range(table, lower, upper, |id, locator| {
+                        if let Some(value) = locator {
+                            let touched = self.state.overlay.contains_key(&(table, id));
+                            match slots[usize::from(snapshot::entity_slot(value)?)] {
+                                // The generation leaves the manifest, so every entity of
+                                // it moves and no counter outlives the move.
+                                None => {}
+                                Some(slot) => {
+                                    let quota = &mut quotas[usize::from(slot)];
+                                    if !touched && *quota == 0 {
+                                        // Untouched, and its generation is not being
+                                        // drained: the records stay where they are and
+                                        // only the index entry moves.
+                                        return writer.carry(
+                                            id,
+                                            snapshot::remap(value, slot),
+                                            &self.state.root,
+                                            &self.state.pager,
+                                        );
+                                    }
+                                    if !touched {
+                                        *quota -= 1;
+                                    }
+                                    // A rewritten entity leaves an unreachable copy behind.
+                                    occupancy.entry((table, slot)).or_default().dead += 1;
+                                }
+                            }
+                        }
+                        let data = self
+                            .state
+                            .load(table, id)?
+                            .ok_or_else(|| corrupt("entity vanished during checkpoint"))?;
+                        writer.append(id, &data)
+                    })?;
+            }
+            let output = writer.finish()?;
+            root.history_generations.extend(output.history_generations);
+            root.files.extend(output.files);
+            root.partitions.extend(output.partitions);
             root.occupancy
                 .entry((table, new_slot))
                 .or_default()
-                .entities += entities;
+                .entities += output.entities;
             fault("checkpoint-files");
         }
         check(
@@ -772,6 +816,12 @@ impl CheckpointJob {
                 .filter(|file| matches!(file.kind, 2 | 6))
                 .count(),
             self.options.limits.max_history_files,
+        )?;
+        check(
+            "index partitions",
+            0,
+            root.partitions.len(),
+            self.options.limits.max_index_partitions,
         )?;
         let payload = root.encode();
         frame::append(&mut self.catalog_file, 4, self.state.lsn, &payload)?;
@@ -1627,7 +1677,7 @@ fn initialize(directory: &Path) -> Result<()> {
     frame::append(&mut wal, 1, 0, &payload)?;
     wal.sync_all()?;
     let mut control = File::create_new(directory.join("control"))?;
-    control.write_all(b"EVEDB004")?;
+    control.write_all(b"EVEDB005")?;
     control.sync_all()?;
     snapshot::sync_directory(&directory.join("catalog"))?;
     snapshot::sync_directory(&directory.join("wal"))?;

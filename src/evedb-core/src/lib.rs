@@ -18,6 +18,7 @@ mod history;
 mod model;
 mod ordered_map;
 mod overlay;
+mod partitions;
 mod reader;
 mod resources;
 mod shared;

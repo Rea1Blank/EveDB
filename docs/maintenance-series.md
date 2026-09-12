@@ -30,3 +30,14 @@ and its history-file owners survive publication. Explicit calls wait outside
 commit coordination; background errors are reported by `wait_for_maintenance`.
 The EVEDB004 marker rejects older directories without modification; migration
 is not implemented. Local Database maintenance remains synchronous.
+
+## Stage 2 implementation
+
+EVEDB005 adds disjoint index routes, original-to-current primary slot maps, and
+per-partition history dependencies. Primary partitions cover 1024 IDs; history
+and snapshot partitions cover 1024 versions of one entity. Trees are packed into
+one file per kind/table/new generation and addressed by root page. Untouched
+partitions keep their original file and page; compaction packs them again.
+`max_index_partitions` bounds metadata before extra trees are created. Recovery
+and snapshot reclamation retain every routed index file and payload dependency.
+Older format markers are rejected without migration or modification.
