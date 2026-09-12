@@ -85,14 +85,29 @@ impl HeapWriter {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn read(pager: &Pager, file: FileId, location: u64, lsn: u64) -> Result<Vec<u8>> {
+    Ok(read_buffer(pager, file, location, lsn)?.into_inner())
+}
+pub(crate) fn read_buffer(
+    pager: &Pager,
+    file: FileId,
+    location: u64,
+    lsn: u64,
+) -> Result<crate::memory::Accounted<Vec<u8>>> {
     let page_id = location >> 16;
     let page = read_page(pager, file, page_id, lsn)?;
     let record = page
         .get(location as u16)
         .ok_or_else(|| corrupt("absent heap slot"))?;
     match record.first() {
-        Some(0) => Ok(record[1..].to_vec()),
+        Some(0) => {
+            let memory = pager.scratch(record.len() - 1)?;
+            Ok(crate::memory::Accounted {
+                value: record[1..].to_vec(),
+                memory,
+            })
+        }
         Some(1) if record.len() >= 13 => {
             let total = u32::from_le_bytes(record[1..5].try_into().unwrap()) as usize;
             let count = u32::from_le_bytes(record[9..13].try_into().unwrap()) as usize;
@@ -103,6 +118,7 @@ pub(crate) fn read(pager: &Pager, file: FileId, location: u64, lsn: u64) -> Resu
                 return Err(corrupt("invalid overflow chain"));
             }
             let header: [u8; 12] = record[1..13].try_into().unwrap();
+            let memory = pager.scratch(total)?;
             let mut bytes = Vec::with_capacity(total);
             for index in 0..count {
                 let chunk_page = read_page(pager, file, page_id + index as u64, lsn)?;
@@ -117,15 +133,22 @@ pub(crate) fn read(pager: &Pager, file: FileId, location: u64, lsn: u64) -> Resu
                 {
                     return Err(corrupt("invalid overflow fragment"));
                 }
-                bytes.extend(&chunk[13..]);
-                if bytes.len() > total {
+                if bytes
+                    .len()
+                    .checked_add(chunk.len() - 13)
+                    .is_none_or(|size| size > total)
+                {
                     return Err(corrupt("overflow chain is too long"));
                 }
+                bytes.extend(&chunk[13..]);
             }
             if bytes.len() != total {
                 return Err(corrupt("truncated overflow chain"));
             }
-            Ok(bytes)
+            Ok(crate::memory::Accounted {
+                value: bytes,
+                memory,
+            })
         }
         _ => Err(corrupt("unknown heap record kind")),
     }

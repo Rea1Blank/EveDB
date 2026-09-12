@@ -272,35 +272,55 @@ impl EntityData {
         }
         Ok(state)
     }
-    pub fn all_events(&self) -> Result<Vec<Event>> {
-        let mut events = if let Some(disk) = &self.disk
-            && self.base.version < disk.through
-        {
-            disk.root.events(
+    #[allow(clippy::too_many_arguments)]
+    pub fn visit_events(
+        &self,
+        pager: &crate::storage::pager::Pager,
+        first: u64,
+        last: u64,
+        check: &mut impl FnMut() -> Result<()>,
+        admit: &mut impl FnMut(usize) -> Result<bool>,
+        visit: &mut impl FnMut(crate::memory::Accounted<Event>) -> Result<bool>,
+    ) -> Result<bool> {
+        if let Some(disk) = &self.disk
+            && first <= last.min(disk.through)
+            && !disk.root.visit_events(
                 &disk.pager,
                 disk.table,
                 self.current.id,
-                self.base.version.saturating_add(1),
-                disk.through,
+                first,
+                last.min(disk.through),
+                check,
+                admit,
+                visit,
             )?
-        } else {
-            Vec::new()
-        };
-        events.extend(
-            self.committed
-                .range((
-                    std::ops::Bound::Excluded(self.base.version),
-                    std::ops::Bound::Unbounded,
-                ))
-                .map(|(_, event)| (**event).clone()),
-        );
-        events.extend(
-            self.events
-                .iter()
-                .filter(|event| event.version > self.base.version)
-                .cloned(),
-        );
-        Ok(events)
+        {
+            return Ok(false);
+        }
+        for event in self
+            .committed
+            .range(first..=last)
+            .map(|(_, event)| &**event)
+            .chain(
+                self.events
+                    .iter()
+                    .filter(|event| (first..=last).contains(&event.version)),
+            )
+        {
+            check()?;
+            let size = crate::memory::event_bytes(event);
+            if !admit(size)? {
+                return Ok(false);
+            }
+            let memory = pager.decoded(size)?;
+            if !visit(crate::memory::Accounted {
+                value: event.clone(),
+                memory,
+            })? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     pub fn retain(&mut self, table: &Table, count: usize) -> Result<()> {
         let version = self.current.version.saturating_sub(count as u64);

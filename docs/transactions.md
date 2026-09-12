@@ -76,7 +76,9 @@ This is the concurrency foundation, not throughput or production qualification:
 - Publication shares overlay paths and unchanged catalogs. Ordinary staging
   reads current/base state; committed event payloads and disk history are shared.
 - Transaction/snapshot limits, monotonic deadlines and abandoned-handle expiry
-  are implemented. Byte accounting covers accepted encoded mutations, not RSS.
+  are implemented. Encoded mutations, decoded transaction allocations, read
+  batches, and raw/decompression scratch have separate logical budgets. These
+  are admission policies, not an RSS measurement.
 - ReadCommitted, Serializable, network sessions, durable request outcomes,
   and sustained throughput qualification remain pending.
 

@@ -19,9 +19,11 @@ pub enum Error {
     Locked,
     /// The operation exceeded its deadline before commit crossed the WAL boundary.
     DeadlineExceeded,
+    /// A caller cancelled a cooperative read.
+    Cancelled,
     /// A transaction or read snapshot expired and released its retained resources.
     TransactionExpired,
-    /// An admission limit was reached before the requested write was accepted.
+    /// An admission limit rejected a write, read allocation, or maintenance step.
     LimitExceeded {
         /// The bounded resource.
         resource: &'static str,
@@ -61,6 +63,7 @@ impl fmt::Display for Error {
             Self::NotFound(s) => write!(f, "not found: {s}"),
             Self::AlreadyExists(s) => write!(f, "already exists: {s}"),
             Self::Locked => f.write_str("the data directory is already open"),
+            Self::Cancelled => f.write_str("read cancelled"),
             Self::DeadlineExceeded => f.write_str("operation deadline exceeded"),
             Self::TransactionExpired => f.write_str("transaction or snapshot expired"),
             Self::LimitExceeded { resource, limit } => {
@@ -113,6 +116,7 @@ impl Error {
             Self::AlreadyExists(s) => Self::AlreadyExists(s.clone()),
             Self::Locked => Self::Locked,
             Self::DeadlineExceeded => Self::DeadlineExceeded,
+            Self::Cancelled => Self::Cancelled,
             Self::TransactionExpired => Self::TransactionExpired,
             Self::LimitExceeded { resource, limit } => Self::LimitExceeded {
                 resource,

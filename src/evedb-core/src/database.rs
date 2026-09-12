@@ -202,11 +202,14 @@ impl Database {
         }
         roots.sort_by_key(|root| root.generation);
         roots.dedup_by_key(|root| root.generation);
-        let pager = Pager::new(
+        let resources = Resources::new(options.limits.clone(), options.timeouts.clone())?;
+        let mut pager = Pager::new(
             directory.clone(),
             options.cache_bytes,
             options.max_open_files,
         );
+        pager.resources = Some(resources.clone());
+        pager.recovering.store(true, Ordering::Relaxed);
         let mut selected = None;
         let mut last_error = None;
         for root in roots.iter().rev() {
@@ -236,7 +239,7 @@ impl Database {
             overlay: crate::overlay::Overlay::new(),
             root_bytes: Some(0),
             pinned_bytes: Some(0),
-            resources: Resources::new(options.limits.clone(), options.timeouts.clone())?,
+            resources,
             charges: OrderedMap::new(),
             pager: Arc::new(pager),
             _lock: Arc::new(lock),
@@ -307,6 +310,7 @@ impl Database {
             db.wal.sync_all()?;
         }
         db.wal.seek(SeekFrom::End(0))?;
+        db.state.pager.recovering.store(false, Ordering::Relaxed);
         Ok(db)
     }
 
@@ -1197,6 +1201,32 @@ impl Staging {
         }
         let bytes = operation.encoded_len();
         let result = (|| {
+            let cost = match &operation {
+                Operation::Create(table, _, fields) => {
+                    3 * crate::memory::fields_bytes(fields)
+                        + 2 * self.table(*table)?.schema().fields.len() * crate::memory::FIELD_BYTES
+                        + 256
+                }
+                Operation::Apply(_, _, fields) => 3 * crate::memory::fields_bytes(fields) + 256,
+                Operation::Snapshot(table, id) | Operation::Retain(table, id, _) => {
+                    self.staged
+                        .get(&(*table, *id))
+                        .map_or(0, |data| crate::memory::entity_bytes(&data.current))
+                        + 256
+                }
+                Operation::Table(table) => {
+                    operation.encoded_len() * 3
+                        + table
+                            .schemas
+                            .iter()
+                            .map(|schema| schema.fields.len() * crate::memory::FIELD_BYTES)
+                            .sum::<usize>()
+                            * 2
+                }
+                Operation::Delete(..) => 256,
+            };
+            self.reservation
+                .grow_decoded(cost, self._permit.is_none())?;
             if self._permit.is_some() {
                 check(
                     "transaction operations",
@@ -1230,12 +1260,25 @@ impl Staging {
             return Ok(());
         }
         let (table_id, id) = operation.entity_key().unwrap();
-        let table = self.table(table_id)?.clone();
+        let table = self
+            .catalog
+            .get(&table_id)
+            .ok_or_else(|| Error::NotFound(format!("table {table_id}")))?;
         if !self.staged.contains_key(&(table_id, id))
             && self.base.catalog.contains_key(&table_id)
-            && let Some(data) = self.base.load(table_id, id)?
+            && let Some(data) = self.base.load_charged(table_id, id, &mut |bytes| {
+                self.reservation.grow_decoded(bytes, self._permit.is_none())
+            })?
         {
             self.staged.insert((table_id, id), data);
+        }
+        if matches!(operation, Operation::Snapshot(..) | Operation::Retain(..))
+            && let Some(data) = self.staged.get(&(table_id, id))
+        {
+            self.reservation.grow_decoded(
+                crate::memory::entity_bytes(&data.current),
+                self._permit.is_none(),
+            )?;
         }
         if let Operation::Create(_, _, fields) = operation {
             if self.staged.contains_key(&(table_id, id)) {
@@ -1243,6 +1286,20 @@ impl Staging {
             }
             let mut fields = fields.clone();
             table.schema().normalize(&mut fields, true)?;
+            if self._permit.is_some() {
+                check(
+                    "decoded record bytes",
+                    0,
+                    std::mem::size_of::<Entity>() + crate::memory::fields_bytes(&fields),
+                    self.options.limits.max_decoded_record_bytes,
+                )?;
+                check(
+                    "encoded record bytes",
+                    0,
+                    25 + fields_encoded_len(&fields),
+                    crate::codec::MAX_RECORD,
+                )?;
+            }
             let current = Entity {
                 id,
                 version: 0,
@@ -1274,6 +1331,24 @@ impl Staging {
                         }
                         let mut fields = fields.clone();
                         table.schema().normalize(&mut fields, false)?;
+                        if self._permit.is_some() {
+                            let (decoded, encoded) =
+                                crate::memory::merged_sizes(&data.current.fields, &fields);
+                            check(
+                                "decoded record bytes",
+                                0,
+                                decoded,
+                                self.options.limits.max_decoded_record_bytes,
+                            )?;
+                            check(
+                                "decoded record bytes",
+                                0,
+                                std::mem::size_of::<crate::memory::Accounted<Event>>()
+                                    + crate::memory::fields_bytes(&fields),
+                                self.options.limits.max_decoded_record_bytes,
+                            )?;
+                            check("encoded record bytes", 0, encoded, crate::codec::MAX_RECORD)?;
+                        }
                         fields
                     } else {
                         Fields::new()
@@ -1297,11 +1372,11 @@ impl Staging {
                             },
                             fields,
                         };
-                    apply_event(&mut data.current, &event, &table)?;
+                    apply_event(&mut data.current, &event, table)?;
                     data.events.push(event);
                 }
                 Operation::Retain(_, _, count) => data.retain(
-                    &table,
+                    table,
                     usize::try_from(*count)
                         .map_err(|_| Error::Invalid("retention count overflow".into()))?,
                 )?,
@@ -1376,6 +1451,14 @@ impl Prepared {
                         }
                         data.snapshots.retain_from(&through);
                         data.disk = persisted.disk;
+                        // A snapshot exactly at the frontier may be an explicit
+                        // override. Transfer its memory ownership before retiring
+                        // the old transaction reservations.
+                        if let Some(snapshot) = data.snapshots.get(&through) {
+                            batch
+                                .reservation
+                                .grow_decoded(crate::memory::entity_bytes(snapshot), false)?;
+                        }
                         if let Some(first) = db.state.root.lsn.checked_add(1) {
                             data.charges.retain_from(&first);
                         } else {

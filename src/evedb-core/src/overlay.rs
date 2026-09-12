@@ -33,6 +33,16 @@ impl Overlay {
         self.entries.range(bounds)
     }
     pub fn insert(&mut self, key: Key, value: Arc<EntityData>) {
+        let previous = self
+            .entries
+            .get(&key)
+            .and_then(|data| data.disk.as_ref())
+            .map(|disk| disk.root.generation);
+        let next = value.disk.as_ref().map(|disk| disk.root.generation);
+        if previous == next {
+            self.entries.insert(key, value);
+            return;
+        }
         if let Some(disk) = self.entries.get(&key).and_then(|old| old.disk.as_ref()) {
             let generation = disk.root.generation;
             let (root, count, bytes) = self.roots.get(&generation).unwrap().clone();

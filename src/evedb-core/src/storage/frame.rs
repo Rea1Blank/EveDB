@@ -13,6 +13,23 @@ pub(crate) struct Frame {
     pub payload: Vec<u8>,
 }
 
+/// Reads and validates only the fixed header before admitting its allocation.
+pub(crate) fn payload_size_at(file: &File, offset: u64, file_len: u64) -> Result<usize> {
+    if offset.checked_add(32).is_none_or(|end| end > file_len) {
+        return Err(corrupt("truncated frame header"));
+    }
+    let mut header = [0; 32];
+    read_exact_at(file, &mut header, offset)?;
+    let size = header_length(&header)?;
+    if offset
+        .checked_add(40 + size)
+        .is_none_or(|end| end > file_len)
+    {
+        return Err(corrupt("truncated indexed frame"));
+    }
+    Ok(size as usize)
+}
+
 pub(crate) fn encode(kind: u16, lsn: u64, payload: &[u8]) -> Result<Vec<u8>> {
     if payload.len() > MAX_FRAME {
         return Err(Error::Invalid("transaction exceeds 64 MiB".into()));
