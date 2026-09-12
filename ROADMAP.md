@@ -147,4 +147,6 @@ These support the isolation/WAL distinctions; EveDB's architecture is our choice
 See [maintenance and bounded reads](docs/maintenance-series.md) and issue #18.
 Stage 1 implements background shared checkpoint/compaction with a frozen WAL
 frontier, bounded job admission, and an uncheckpointed transaction-WAL limit.
-Stages 2 (partitioned indexes) and 3 (bounded streaming reads) follow separately.
+Stage 2 implements packed, disjoint index partitions with direct root routing,
+unchanged-partition reuse, slot translation, and bounded routing admission.
+Stage 3 (bounded streaming reads) follows separately.

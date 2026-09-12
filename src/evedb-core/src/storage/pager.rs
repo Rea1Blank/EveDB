@@ -47,9 +47,11 @@ impl FileId {
             0 => dir.join("current.pages"),
             1 => dir.join("bases.pages"),
             2 => dir.join("snapshots.pages"),
-            3 => dir.join("primary.index"),
-            4 => dir.join("history.index"),
-            5 => dir.join("snapshots.index"),
+            3..=5 => dir.join("indexes").join(format!(
+                "{:020}.{}",
+                self.segment,
+                ["primary.index", "history.index", "snapshots.index"][usize::from(self.kind - 3)]
+            )),
             6 => dir
                 .join("history")
                 .join(format!("{:020}.events", self.segment)),

@@ -8,7 +8,6 @@ use crate::{Result, checksum::crc32c, error::corrupt};
 use std::{
     fs::File,
     io::{Seek, SeekFrom, Write},
-    path::Path,
     sync::Arc,
 };
 
@@ -49,19 +48,24 @@ pub(crate) struct IndexWriter {
     file: File,
     lsn: u64,
     next: u64,
+    base: u64,
     count: u64,
     leaf: Vec<(Key, Value)>,
     level: Vec<(Key, u64)>,
     previous: Option<Key>,
 }
 impl IndexWriter {
-    pub fn create(path: &Path, lsn: u64) -> Result<Self> {
-        let mut file = File::create_new(path)?;
+    #[cfg(test)]
+    pub fn create(path: &std::path::Path, lsn: u64) -> Result<Self> {
+        Self::from_file(File::create_new(path)?, lsn, 0)
+    }
+    pub fn from_file(mut file: File, lsn: u64, base: u64) -> Result<Self> {
         file.write_all(&[0; PAGE_SIZE])?;
         Ok(Self {
             file,
             lsn,
-            next: 1,
+            next: base + 1,
+            base,
             count: 0,
             leaf: Vec::new(),
             level: Vec::new(),
@@ -98,7 +102,12 @@ impl IndexWriter {
         self.leaf.clear();
         Ok(())
     }
-    pub fn finish(mut self) -> Result<()> {
+    #[cfg(test)]
+    pub fn finish(self) -> Result<()> {
+        self.finish_part()?.sync_all()?;
+        Ok(())
+    }
+    pub fn finish_part(mut self) -> Result<File> {
         self.flush_leaf(0)?;
         while self.level.len() > 1 {
             let mut parents = Vec::new();
@@ -117,12 +126,13 @@ impl IndexWriter {
             self.level = parents;
         }
         let root = self.level.first().map_or(0, |item| item.1);
-        let mut meta = page(0, 0, self.lsn, 0, root);
+        let mut meta = page(0, self.base, self.lsn, 0, root);
         put(&mut meta, 40, self.count);
-        self.file.seek(SeekFrom::Start(0))?;
+        self.file
+            .seek(SeekFrom::Start(self.base * PAGE_SIZE as u64))?;
         write(&mut self.file, meta)?;
-        self.file.sync_all()?;
-        Ok(())
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(self.file)
     }
 }
 
@@ -154,7 +164,7 @@ impl Node {
         let node = Self { bytes };
         let count = node.count();
         let width = match node.kind() {
-            0 if expected_id == 0 && count == 0 => return Ok(node),
+            0 if count == 0 && (node.next() == 0 || node.next() > expected_id) => return Ok(node),
             1 => LEAF_WIDTH,
             2 => BRANCH_WIDTH,
             _ => return Err(corrupt("invalid index node kind")),
@@ -246,11 +256,20 @@ fn node(pager: &Pager, file: FileId, id: u64, lsn: u64) -> Result<Arc<Node>> {
 ///
 /// Branch separators are the first key of their subtree, so the chosen child
 /// always covers the predecessor of `key` as well as `key` itself.
-fn descend(pager: &Pager, file: FileId, lsn: u64, key: Key) -> Result<Option<Arc<Node>>> {
+fn descend(
+    pager: &Pager,
+    file: FileId,
+    lsn: u64,
+    base: u64,
+    key: Key,
+) -> Result<Option<Arc<Node>>> {
     if !pager.file(file)?.len.is_multiple_of(PAGE_SIZE as u64) {
         return Err(corrupt("truncated index file"));
     }
-    let meta = node(pager, file, 0, lsn)?;
+    let meta = node(pager, file, base, lsn)?;
+    if meta.kind() != 0 {
+        return Err(corrupt("index root is not metadata"));
+    }
     let mut id = meta.next();
     while id != 0 {
         let current = node(pager, file, id, lsn)?;
@@ -263,34 +282,42 @@ fn descend(pager: &Pager, file: FileId, lsn: u64, key: Key) -> Result<Option<Arc
     Ok(None)
 }
 
-pub(crate) fn lookup(pager: &Pager, file: FileId, lsn: u64, key: Key) -> Result<Option<Value>> {
-    let Some(leaf) = descend(pager, file, lsn, key)? else {
+pub(crate) fn lookup_at(
+    pager: &Pager,
+    file: FileId,
+    lsn: u64,
+    base: u64,
+    key: Key,
+) -> Result<Option<Value>> {
+    let Some(leaf) = descend(pager, file, lsn, base, key)? else {
         return Ok(None);
     };
     let index = leaf.lower_bound(key);
     Ok((index < leaf.count() && leaf.key(index) == key).then(|| leaf.value(index)))
 }
-pub(crate) fn floor(
+pub(crate) fn floor_at(
     pager: &Pager,
     file: FileId,
     lsn: u64,
+    base: u64,
     key: Key,
 ) -> Result<Option<(Key, Value)>> {
-    let Some(leaf) = descend(pager, file, lsn, key)? else {
+    let Some(leaf) = descend(pager, file, lsn, base, key)? else {
         return Ok(None);
     };
     Ok(leaf
         .floor_index(key)
         .map(|index| (leaf.key(index), leaf.value(index))))
 }
-pub(crate) fn scan(
+pub(crate) fn scan_at(
     pager: &Pager,
     file: FileId,
     lsn: u64,
+    base: u64,
     lower: Key,
     upper: Key,
 ) -> Result<IndexCursor<'_>> {
-    let leaf = descend(pager, file, lsn, lower)?;
+    let leaf = descend(pager, file, lsn, base, lower)?;
     let position = leaf.as_ref().map_or(0, |leaf| leaf.lower_bound(lower));
     Ok(IndexCursor {
         pager,
@@ -301,6 +328,29 @@ pub(crate) fn scan(
         position,
         failed: false,
     })
+}
+#[cfg(test)]
+pub(crate) fn lookup(pager: &Pager, file: FileId, lsn: u64, key: Key) -> Result<Option<Value>> {
+    lookup_at(pager, file, lsn, 0, key)
+}
+#[cfg(test)]
+pub(crate) fn floor(
+    pager: &Pager,
+    file: FileId,
+    lsn: u64,
+    key: Key,
+) -> Result<Option<(Key, Value)>> {
+    floor_at(pager, file, lsn, 0, key)
+}
+#[cfg(test)]
+pub(crate) fn scan(
+    pager: &Pager,
+    file: FileId,
+    lsn: u64,
+    lower: Key,
+    upper: Key,
+) -> Result<IndexCursor<'_>> {
+    scan_at(pager, file, lsn, 0, lower, upper)
 }
 pub(crate) struct IndexCursor<'a> {
     pager: &'a Pager,

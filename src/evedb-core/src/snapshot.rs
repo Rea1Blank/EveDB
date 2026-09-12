@@ -9,7 +9,7 @@ use crate::{
     storage::{
         frame,
         heap::{self, HeapWriter},
-        index::{self, IndexWriter},
+        index::{self},
         pager::{FileId, Pager, table_path},
     },
 };
@@ -32,12 +32,17 @@ pub(crate) struct GenerationInfo {
 }
 #[derive(Clone)]
 pub(crate) struct FileInfo {
-    generation: u64,
-    table: u64,
-    kind: u8,
-    segment: u64,
-    size: u64,
-    crc: u32,
+    pub(crate) generation: u64,
+    pub(crate) table: u64,
+    pub(crate) kind: u8,
+    pub(crate) segment: u64,
+    pub(crate) size: u64,
+    pub(crate) crc: u32,
+}
+impl FileInfo {
+    pub fn id(&self) -> FileId {
+        FileId::new(self.table, self.generation, self.kind, self.segment)
+    }
 }
 /// How many entities one table left in one generation, and how many died since.
 ///
@@ -66,6 +71,7 @@ pub(crate) struct Root {
     /// Referenced generations in ascending order; a locator's slot indexes this.
     pub generations: Vec<GenerationInfo>,
     pub files: Vec<FileInfo>,
+    pub partitions: BTreeMap<crate::partitions::Route, crate::partitions::Partition>,
     pub history_generations: BTreeMap<u64, u64>,
     pub history_compacted: bool,
     /// Live and superseded entity counts per table and generation slot.
@@ -90,6 +96,7 @@ impl Root {
                 lsn: 0,
             }],
             files: Vec::new(),
+            partitions: BTreeMap::new(),
             history_generations: BTreeMap::new(),
             history_compacted: true,
             occupancy: BTreeMap::new(),
@@ -107,6 +114,32 @@ impl Root {
         for entry in &self.generations {
             e.u64(entry.generation);
             e.u64(entry.lsn);
+        }
+        e.u64(self.partitions.len() as u64);
+        for (&(table, kind, lower), part) in &self.partitions {
+            e.u64(table);
+            e.u8(kind);
+            e.u64(lower[0]);
+            e.u64(lower[1]);
+            e.u64(part.file.generation);
+            e.u64(part.file.segment);
+            e.u64(part.lsn);
+            e.u64(part.base);
+            for value in part.first.into_iter().chain(part.last) {
+                e.u64(value);
+            }
+            e.u64(part.slots.len() as u64);
+            for (&old, &new) in &part.slots {
+                e.u8(old);
+                e.u8(new);
+            }
+            e.u64(part.dependencies.len() as u64);
+            for file in &part.dependencies {
+                e.u64(file.table);
+                e.u64(file.generation);
+                e.u8(file.kind);
+                e.u64(file.segment);
+            }
         }
         e.u8(u8::from(self.history_compacted));
         e.u64(self.history_generations.len() as u64);
@@ -165,6 +198,66 @@ impl Root {
         {
             return Err(corrupt("invalid generation list"));
         }
+        let n = d.count(105)?;
+        let mut partitions = BTreeMap::new();
+        let mut index_files = BTreeSet::new();
+        let mut index_roots = BTreeSet::new();
+        for _ in 0..n {
+            let table = d.u64()?;
+            let kind = d.u8()?;
+            let lower = [d.u64()?, d.u64()?];
+            let file = FileId::new(table, d.u64()?, kind, d.u64()?);
+            let sequence = d.u64()?;
+            let base = d.u64()?;
+            let first = [d.u64()?, d.u64()?];
+            let last = [d.u64()?, d.u64()?];
+            let count = d.count(2)?;
+            let mut slots = BTreeMap::new();
+            for _ in 0..count {
+                let old = d.u8()?;
+                let new = d.u8()?;
+                if usize::from(new) >= generations.len() || slots.insert(old, new).is_some() {
+                    return Err(corrupt("invalid partition slot mapping"));
+                }
+            }
+            let count = d.count(25)?;
+            let mut dependencies = BTreeSet::new();
+            for _ in 0..count {
+                let dependency = FileId::new(d.u64()?, d.u64()?, d.u8()?, d.u64()?);
+                if dependency.table != table
+                    || !matches!(dependency.kind, 2 | 6)
+                    || !dependencies.insert(dependency)
+                {
+                    return Err(corrupt("invalid partition dependency"));
+                }
+            }
+            if !catalog.contains_key(&table)
+                || !(3..=5).contains(&kind)
+                || file.generation > generation
+                || sequence > lsn
+                || first > last
+                || crate::partitions::bucket(kind, first) != lower
+                || crate::partitions::bucket(kind, last) != lower
+                || (kind != 3 && !slots.is_empty())
+                || (kind == 3 && slots.is_empty())
+                || !index_roots.insert((file, base))
+            {
+                return Err(corrupt("invalid index partition"));
+            }
+            index_files.insert(file);
+            let part = crate::partitions::Partition {
+                base,
+                file,
+                lsn: sequence,
+                first,
+                last,
+                slots,
+                dependencies,
+            };
+            if partitions.insert((table, kind, lower), part).is_some() {
+                return Err(corrupt("duplicate index partition route"));
+            }
+        }
         let history_compacted = match d.u8()? {
             0 => false,
             1 => true,
@@ -196,25 +289,31 @@ impl Root {
             };
             if !catalog.contains_key(&file.table)
                 || file.kind > 6
-                || (file.kind != 6 && file.segment != 0)
+                || (file.kind < 3 && file.segment != 0)
                 || (if matches!(file.kind, 2 | 6) {
                     !history_generations.contains_key(&file.generation)
+                } else if matches!(file.kind, 3..=5) {
+                    !index_files.contains(&file.id())
                 } else {
                     !generations
                         .iter()
                         .any(|entry| entry.generation == file.generation)
                 })
-                || (matches!(file.kind, 3..=5) && file.generation != generation)
                 || !seen.insert((file.table, file.kind, file.generation, file.segment))
             {
                 return Err(corrupt("invalid checkpoint file reference"));
             }
             files.push(file);
         }
-        for id in catalog.keys() {
-            for kind in 3..=5 {
-                if !seen.contains(&(*id, kind, generation, 0)) {
-                    return Err(corrupt("incomplete checkpoint manifest"));
+        for part in partitions.values() {
+            if !files.iter().any(|info| {
+                info.id() == part.file && part.base < info.size / crate::storage::PAGE_SIZE as u64
+            }) {
+                return Err(corrupt("partition root outside index file"));
+            }
+            for file in std::iter::once(&part.file).chain(&part.dependencies) {
+                if !seen.contains(&(file.table, file.kind, file.generation, file.segment)) {
+                    return Err(corrupt("incomplete partition manifest"));
                 }
             }
         }
@@ -242,6 +341,7 @@ impl Root {
             catalog,
             generations,
             files,
+            partitions,
             history_generations,
             history_compacted,
             occupancy,
@@ -261,10 +361,6 @@ impl Root {
             FileId::new(table, entry.generation, kind, segment),
             entry.lsn,
         ))
-    }
-    /// Locates the primary index, which always belongs to the newest generation.
-    pub(crate) fn file(&self, table: TableId, kind: u8) -> FileId {
-        FileId::new(table, self.generation, kind, 0)
     }
     /// Lists the physical identity of every file this manifest references.
     pub(crate) fn file_ids(&self) -> impl Iterator<Item = FileId> + '_ {
@@ -362,7 +458,7 @@ impl Root {
         if !self.catalog.contains_key(&table) {
             return Ok(None);
         }
-        let Some(value) = index::lookup(pager, self.file(table, 3), self.lsn, [id, 0])? else {
+        let Some(value) = self.lookup_index(pager, table, 3, [id, 0])? else {
             return Ok(None);
         };
         Ok(Some((entity_slot(value)?, value)))
@@ -446,23 +542,20 @@ impl Root {
             .catalog
             .get(&table)
             .ok_or_else(|| Error::NotFound(format!("table {table}")))?;
-        if snapshots {
-            let (file, lsn) = (self.file(table, 5), self.lsn);
-            if let Some((key, location)) = index::floor(pager, file, lsn, [id, version])?
-                && key[0] == id
-                && key[1] >= state.version
-            {
-                state = self.history_state(pager, table, location, id)?;
-                if state.version != key[1] {
-                    return Err(corrupt("invalid snapshot identity"));
-                }
+        if snapshots
+            && let Some((key, location)) = self.floor_index(pager, table, 5, [id, version])?
+            && key[0] == id
+            && key[1] >= state.version
+        {
+            state = self.history_state(pager, table, location, id)?;
+            if state.version != key[1] {
+                return Err(corrupt("invalid snapshot identity"));
             }
         }
         if state.version == version {
             return Ok(state);
         }
-        let (file, lsn) = (self.file(table, 4), self.lsn);
-        for entry in index::scan(pager, file, lsn, [id, state.version + 1], [id, version])? {
+        for entry in self.scan_index(pager, table, 4, [id, state.version + 1], [id, version])? {
             let (key, location) = entry?;
             let (entity_id, event, lsn) = self.event_at(pager, table, location)?;
             if entity_id != id
@@ -514,13 +607,7 @@ impl Root {
         if first > last {
             return Ok(events);
         }
-        for item in index::scan(
-            pager,
-            self.file(table, 4),
-            self.lsn,
-            [id, first],
-            [id, last],
-        )? {
+        for item in self.scan_index(pager, table, 4, [id, first], [id, last])? {
             let (key, location) = item?;
             let (entity_id, event, lsn) = self.event_at(pager, table, location)?;
             if entity_id != id
@@ -663,13 +750,17 @@ fn unpack(bytes: &[u8]) -> Result<(u64, Vec<u8>)> {
     Ok((id, result))
 }
 
+pub(crate) struct TableOutput {
+    pub files: Vec<FileInfo>,
+    pub entities: u64,
+    pub history_generations: BTreeMap<u64, u64>,
+    pub partitions: BTreeMap<crate::partitions::Route, crate::partitions::Partition>,
+}
 pub(crate) struct TableWriter {
     current: HeapWriter,
     bases: HeapWriter,
     snapshots: HeapWriter,
-    primary: IndexWriter,
-    history_index: IndexWriter,
-    snapshot_index: IndexWriter,
+    indexes: crate::partitions::Indexes,
     history: File,
     segment: u64,
     segment_limit: u64,
@@ -682,6 +773,7 @@ pub(crate) struct TableWriter {
     reused: BTreeMap<FileId, FileInfo>,
     history_generations: BTreeMap<u64, u64>,
     rewrite_history: bool,
+    rewrite_indexes: bool,
 }
 impl TableWriter {
     #[allow(clippy::too_many_arguments)]
@@ -694,17 +786,24 @@ impl TableWriter {
         limit: u64,
         compress: bool,
         rewrite_history: bool,
+        max_index_partitions: usize,
+        rewrite_indexes: bool,
     ) -> Result<Self> {
         let dir = table_path(directory, table, generation);
         fs::create_dir_all(dir.join("history"))?;
+        fs::create_dir_all(dir.join("indexes"))?;
         let path = |kind| FileId::new(table, generation, kind, 0).path(directory);
         Ok(Self {
             current: HeapWriter::create(&path(0), lsn)?,
             bases: HeapWriter::create(&path(1), lsn)?,
             snapshots: HeapWriter::create(&path(2), lsn)?,
-            primary: IndexWriter::create(&path(3), lsn)?,
-            history_index: IndexWriter::create(&path(4), lsn)?,
-            snapshot_index: IndexWriter::create(&path(5), lsn)?,
+            indexes: crate::partitions::Indexes::new(
+                directory,
+                table,
+                generation,
+                lsn,
+                max_index_partitions,
+            ),
             history: File::create_new(path(6))?,
             segment: 0,
             segment_limit: limit,
@@ -717,6 +816,7 @@ impl TableWriter {
             reused: BTreeMap::new(),
             history_generations: [(generation, lsn)].into(),
             rewrite_history,
+            rewrite_indexes,
         })
     }
     /// Records an entity that already lives in a kept generation.
@@ -730,7 +830,7 @@ impl TableWriter {
         root: &Root,
         pager: &Pager,
     ) -> Result<()> {
-        self.primary.append([id, 0], value)?;
+        self.indexes.append(3, [id, 0], value, None)?;
         self.copy_history(root, pager, id, 0, u64::MAX, None)
     }
     fn remember(&mut self, root: &Root, file: FileId) -> Result<()> {
@@ -753,6 +853,39 @@ impl TableWriter {
         }
         Ok(())
     }
+    pub fn carry_partition(
+        &mut self,
+        root: &Root,
+        route: crate::partitions::Route,
+        slots: &[Option<u8>; heap::MAX_SLOTS],
+    ) -> Result<()> {
+        let mut part = root.partitions[&route].clone();
+        for slot in part.slots.values_mut() {
+            *slot =
+                slots[usize::from(*slot)].ok_or_else(|| corrupt("reused collected partition"))?;
+        }
+        for &file in &part.dependencies {
+            self.remember(root, file)?;
+        }
+        self.indexes.reuse(route, part, root)
+    }
+    pub fn carry_partition_history(
+        &mut self,
+        root: &Root,
+        lower: u64,
+        upper: u64,
+        slots: &[Option<u8>; heap::MAX_SLOTS],
+    ) -> Result<()> {
+        for kind in 4..=5 {
+            for (&route, _) in root
+                .partitions
+                .range((self.table, kind, [lower, 0])..=(self.table, kind, [upper, u64::MAX]))
+            {
+                self.carry_partition(root, route, slots)?;
+            }
+        }
+        Ok(())
+    }
     fn copy_history(
         &mut self,
         root: &Root,
@@ -762,48 +895,79 @@ impl TableWriter {
         last: u64,
         overrides: Option<&EntityData>,
     ) -> Result<()> {
-        for entry in index::scan(
-            pager,
-            root.file(self.table, 5),
-            root.lsn,
-            [id, base],
-            [id, last],
-        )? {
-            let (key, location) = entry?;
-            if overrides.is_some_and(|data| data.snapshots.contains_key(&key[1])) {
-                continue;
-            }
-            if self.rewrite_history {
-                let state = root.history_state(pager, self.table, location, id)?;
-                self.append_snapshot(id, &state)?;
-            } else {
-                self.remember(root, FileId::new(self.table, location[0], 2, 0))?;
-                self.snapshot_index.append(key, location)?;
-            }
-        }
-        if base >= last {
-            return Ok(());
-        }
-        for entry in index::scan(
-            pager,
-            root.file(self.table, 4),
-            root.lsn,
-            [id, base + 1],
-            [id, last],
-        )? {
-            let (key, location) = entry?;
-            if self.rewrite_history {
-                let (entity_id, event, lsn) = root.event_at(pager, self.table, location)?;
-                if entity_id != id || event.version != key[1] || event.transaction != lsn {
-                    return Err(corrupt("invalid collected event"));
+        for kind in [5, 4] {
+            let first = if kind == 4 {
+                if base >= last {
+                    continue;
                 }
-                self.append_event(id, &event)?;
+                base + 1
             } else {
-                self.remember(
-                    root,
-                    FileId::new(self.table, location[0], 6, event_split(location[1]).0),
-                )?;
-                self.history_index.append(key, location)?;
+                base
+            };
+            let low = crate::partitions::bucket(kind, [id, first]);
+            let high = crate::partitions::bucket(kind, [id, last]);
+            for (&route, part) in root
+                .partitions
+                .range((self.table, kind, low)..=(self.table, kind, high))
+            {
+                let upper = crate::partitions::end(kind, route.2)[1];
+                let modified = overrides.is_some_and(|data| {
+                    if kind == 5 {
+                        data.snapshots.range(route.2[1]..=upper).next().is_some()
+                    } else {
+                        data.committed.range(route.2[1]..=upper).next().is_some()
+                            || data
+                                .events
+                                .iter()
+                                .any(|event| (route.2[1]..=upper).contains(&event.version))
+                    }
+                });
+                if !self.rewrite_history
+                    && !self.rewrite_indexes
+                    && !modified
+                    && first <= part.first[1]
+                    && last >= part.last[1]
+                {
+                    for &file in &part.dependencies {
+                        self.remember(root, file)?;
+                    }
+                    self.indexes.reuse(route, part.clone(), root)?;
+                    continue;
+                }
+                for entry in index::scan_at(
+                    pager,
+                    part.file,
+                    part.lsn,
+                    part.base,
+                    [id, first],
+                    [id, last],
+                )? {
+                    let (key, location) = entry?;
+                    if kind == 5 {
+                        if overrides.is_some_and(|data| data.snapshots.contains_key(&key[1])) {
+                            continue;
+                        }
+                        if self.rewrite_history {
+                            let state = root.history_state(pager, self.table, location, id)?;
+                            self.append_snapshot(id, &state)?;
+                        } else {
+                            let file = FileId::new(self.table, location[0], 2, 0);
+                            self.remember(root, file)?;
+                            self.indexes.append(5, key, location, Some(file))?;
+                        }
+                    } else if self.rewrite_history {
+                        let (entity_id, event, lsn) = root.event_at(pager, self.table, location)?;
+                        if entity_id != id || event.version != key[1] || event.transaction != lsn {
+                            return Err(corrupt("invalid collected event"));
+                        }
+                        self.append_event(id, &event)?;
+                    } else {
+                        let file =
+                            FileId::new(self.table, location[0], 6, event_split(location[1]).0);
+                        self.remember(root, file)?;
+                        self.indexes.append(4, key, location, Some(file))?;
+                    }
+                }
             }
         }
         Ok(())
@@ -814,7 +978,7 @@ impl TableWriter {
             self.current.append(&encode_entity(&data.current))?,
         );
         let base = heap::locate(self.slot, self.bases.append(&encode_entity(&data.base))?);
-        self.primary.append([id, 0], [current, base])?;
+        self.indexes.append(3, [id, 0], [current, base], None)?;
         self.entities += 1;
         if let Some(disk) = &data.disk
             && data.base.version <= disk.through
@@ -844,8 +1008,12 @@ impl TableWriter {
     }
     fn append_snapshot(&mut self, id: u64, state: &Entity) -> Result<()> {
         let location = self.snapshots.append(&encode_entity(state))?;
-        self.snapshot_index
-            .append([id, state.version], [self.generation, location])
+        self.indexes.append(
+            5,
+            [id, state.version],
+            [self.generation, location],
+            Some(FileId::new(self.table, self.generation, 2, 0)),
+        )
     }
     fn append_event(&mut self, id: u64, event: &Event) -> Result<()> {
         let payload = pack(id, &encode_event(event), self.compress);
@@ -863,20 +1031,23 @@ impl TableWriter {
         let offset = self.history.stream_position()?;
         let location = event_location(self.segment, offset)?;
         frame::append(&mut self.history, 3, event.transaction, &payload)?;
-        self.history_index
-            .append([id, event.version], [self.generation, location])
+        self.indexes.append(
+            4,
+            [id, event.version],
+            [self.generation, location],
+            Some(FileId::new(self.table, self.generation, 6, self.segment)),
+        )
     }
-    pub fn finish(self) -> Result<(Vec<FileInfo>, u64, BTreeMap<u64, u64>)> {
+    pub fn finish(self) -> Result<TableOutput> {
         let entities = self.entities;
         self.current.finish()?;
         self.bases.finish()?;
         self.snapshots.finish()?;
-        self.primary.finish()?;
-        self.history_index.finish()?;
-        self.snapshot_index.finish()?;
+        let (index_files, partitions) = self.indexes.finish()?;
         self.history.sync_all()?;
         let mut files: Vec<_> = self.reused.into_values().collect();
-        let kinds = (0..6)
+        files.extend(index_files);
+        let kinds = (0..3)
             .map(|kind| (kind, 0))
             .chain((0..=self.segment).map(|segment| (6, segment)));
         for (kind, segment) in kinds {
@@ -894,10 +1065,16 @@ impl TableWriter {
         }
         let dir = table_path(&self.directory, self.table, self.generation);
         sync_directory(&dir.join("history"))?;
+        sync_directory(&dir.join("indexes"))?;
         sync_directory(&dir)?;
         sync_directory(dir.parent().unwrap())?;
         sync_directory(&self.directory.join("tables"))?;
-        Ok((files, entities, self.history_generations))
+        Ok(TableOutput {
+            files,
+            entities,
+            history_generations: self.history_generations,
+            partitions,
+        })
     }
 }
 

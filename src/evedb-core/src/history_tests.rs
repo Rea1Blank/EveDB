@@ -13,6 +13,114 @@ fn schema() -> Schema {
 fn fields(byte: u8, size: usize) -> Fields {
     [(1, Value::Bytes(vec![byte; size]))].into()
 }
+
+#[test]
+fn unchanged_primary_and_history_partitions_keep_their_files_and_survive_slot_remapping() {
+    let dir = TempDir::new();
+    let mut db = Database::open_with_options(
+        &dir.0,
+        Options {
+            snapshot_interval: 32,
+            checkpoint_bytes: 64 * 1024 * 1024,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let table = db.create_table("items", schema()).unwrap();
+    db.create(table, 1, fields(1, 8)).unwrap();
+    db.write(|tx| {
+        for i in 1..=2050 {
+            tx.apply(table, 1, fields((i % 251) as u8, 8))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    db.checkpoint().unwrap();
+    db.create(table, 4096, fields(9, 8)).unwrap();
+    db.checkpoint().unwrap();
+    let first = &db.state.root.partitions[&(table, 4, [1, 0])];
+    let second = &db.state.root.partitions[&(table, 4, [1, 1024])];
+    assert_eq!(
+        first.file, second.file,
+        "small trees share one immutable file"
+    );
+    assert_ne!(first.base, second.base, "each tree has its own direct root");
+    let routes = [
+        (table, 3, [4096, 0]),
+        (table, 4, [1, 0]),
+        (table, 4, [1, 1024]),
+        (table, 5, [1, 0]),
+    ];
+    let before: Vec<_> = routes
+        .iter()
+        .map(|route| db.state.root.partitions[route].file)
+        .collect();
+    let pin = db.reader().pin().unwrap();
+    db.apply(table, 1, fields(7, 8)).unwrap();
+    db.checkpoint().unwrap();
+    db.checkpoint().unwrap();
+    for (route, file) in routes.into_iter().zip(before) {
+        assert_eq!(db.state.root.partitions[&route].file, file, "{route:?}");
+    }
+    assert_eq!(db.get(table, 4096).unwrap().unwrap().fields, fields(9, 8));
+    for version in [0, 1, 1023, 1024, 1025, 2047, 2048, 2050, 2051] {
+        assert_eq!(
+            db.get_at_version(table, 1, version).unwrap(),
+            db.replay_to_version(table, 1, version).unwrap()
+        );
+    }
+    db.retain_last(table, 1, 100).unwrap();
+    db.checkpoint().unwrap();
+    assert!(!db.state.root.partitions.contains_key(&(table, 4, [1, 0])));
+    assert_eq!(db.events(table, 1).unwrap().len(), 100);
+    db.compact().unwrap();
+    db.checkpoint().unwrap();
+    assert_eq!(pin.events(table, 1).unwrap().len(), 2050);
+    drop(pin);
+    drop(db);
+    let db = Database::open(&dir.0).unwrap();
+    assert_eq!(db.events(table, 1).unwrap().len(), 100);
+    assert_eq!(db.get(table, 4096).unwrap().unwrap().fields, fields(9, 8));
+}
+
+#[test]
+fn partition_routes_cover_sparse_maximum_ids_and_admit_before_extra_index_files() {
+    let dir = TempDir::new();
+    let options = Options {
+        snapshot_interval: 0,
+        limits: crate::Limits {
+            max_index_partitions: 2,
+            ..crate::Limits::default()
+        },
+        ..Options::default()
+    };
+    let mut db = Database::open_with_options(&dir.0, options).unwrap();
+    let table = db.create_table("items", schema()).unwrap();
+    for id in [0, 1023, u64::MAX] {
+        db.create(table, id, fields(1, 8)).unwrap();
+    }
+    db.checkpoint().unwrap();
+    let mut ids = Vec::new();
+    db.scan(table, |entity| {
+        ids.push(entity.id);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(ids, [0, 1023, u64::MAX]);
+    db.create(table, 1024, fields(2, 8)).unwrap();
+    assert!(matches!(
+        db.checkpoint(),
+        Err(Error::LimitExceeded {
+            resource: "index partitions",
+            ..
+        })
+    ));
+    drop(db);
+    let mut db = Database::open(&dir.0).unwrap();
+    assert!(db.get(table, 1024).unwrap().is_some());
+    db.checkpoint().unwrap();
+    assert!(db.get(table, u64::MAX).unwrap().is_some());
+}
 #[test]
 fn writes_load_only_current_and_base_and_share_committed_event_payloads() {
     let dir = TempDir::new();

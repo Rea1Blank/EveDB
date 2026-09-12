@@ -50,7 +50,7 @@ rename keeps the table ID and physical identity.
 
 ```text
 data/
-  control                              format marker EVEDB004
+  control                              format marker EVEDB005
   LOCK                                 exclusive OS lock
   catalog/
     <generation>.catalog               schemas, file sizes and CRC32C checksums
@@ -61,9 +61,9 @@ data/
       current.pages                    latest entity states and tombstones
       bases.pages                      retained reconstruction bases
       snapshots.pages                  optional acceleration states
-      primary.index                    entity -> current/base locations
-      history.index                    (entity, version) -> generation + segment/offset
-      snapshots.index                  (entity, version) -> generation + snapshot location
+      indexes/00000000000000000000.primary.index   packed primary trees
+      indexes/00000000000000000000.history.index   packed event trees
+      indexes/00000000000000000000.snapshots.index packed snapshot trees
       history/
         <segment-id>.events             sequential framed event records
 ```
@@ -84,11 +84,11 @@ absolute generation number; event locations pack a 16-bit segment and 48-bit byt
 offset, while snapshot locations carry a raw heap locator. The manifest records
 historical page sequences independently of current-state generation slots.
 Ordinary checkpoints copy index references and append new payloads. They do not
-rewrite old event payloads when a current record moves. EVEDB004 rejects older
+rewrite old event payloads when a current record moves. EVEDB005 rejects older
 control formats explicitly; no automatic migration or data deletion is performed.
 
 Current rows use an 8 KiB slotted heap and a separate B+tree primary index. The
-tree is bulk-built bottom-up during a checkpoint; transactional writes first
+trees are bulk-built bottom-up for changed partitions; transactional writes first
 enter the WAL and an in-memory overlay. This version does not split or mutate
 tree pages in place. Linked leaves support ordered range scans. Branch separators
 carry the first key of their subtree, so a descent reaches the leaf that owns
@@ -170,7 +170,7 @@ Checkpointing proceeds as follows:
 1. Reserve a generation, freeze the committed frontier and rotate WAL with a
    header referencing the previous root. New transactions use the new segment.
 2. Write changed/collected current states and bases; carry untouched records.
-   Rebuild primary/history/snapshot indexes, reuse referenced immutable history
+   Replace changed primary/history/snapshot partitions, reuse immutable history
    files, and append only new events and acceleration snapshots.
 3. Synchronize the files and write a checked catalog/manifest listing the files
    of every referenced generation with their sizes and whole-file checksums.
@@ -238,9 +238,11 @@ for one full pass.
 The generation budget bounds current-state fragmentation. History payload files
 have a separate admission limit (4096 by default), independent of retained data
 size. A checkpoint exceeding it fails before publication; explicit compaction
-and retention allow progress without silently discarding acknowledged history. It does not bound the read path — the primary index is
-rebuilt in full by every checkpoint and names each entity's generation directly,
-so a point read costs one descent no matter how long the chain is.
+and retention allow progress without silently discarding acknowledged history.
+The index directory routes each lookup directly to one disjoint tree; historical
+range reads visit only intersecting partitions. No overlapping-run merge is
+needed. A primary partition records its original-to-current generation-slot
+translation, so removing an unrelated generation does not rewrite its entries.
 
 The recovery WAL and entity history have different lifetimes. History is kept
 according to retention, while WAL is retained according to checkpoint recovery.
@@ -286,8 +288,10 @@ Use disposable data while these guarantees and formats mature.
 
 Shared checkpoints and compaction build on a worker or the explicit caller
 without holding commit coordination. Local Database maintenance is synchronous.
-Primary/history/snapshot indexes still rebuild in full; partitioning is the next
-stage. Startup verifies every referenced file checksum. Publication still requires
+Only changed index partitions rebuild. Primary ranges span 1024 IDs; event and
+snapshot ranges span 1024 versions of one entity. Multiple trees share an
+immutable file, with separate root-page addresses. There are at most three new
+index files per table per checkpoint, regardless of partition count. Startup verifies every referenced file checksum. Publication still requires
 a WAL sync, and builders compete with writers for disk bandwidth.
 Current-state density is counted in entities rather than bytes.
 
@@ -299,8 +303,13 @@ the cache before it is deleted. The cache budget is a page count derived from
 current/base records and carry a lazy history descriptor. In-memory committed
 events and snapshots share immutable ordered trees. Historical reads and explicit
 compaction load the requested history; recovery rebuilds recent events from WAL. The WAL size
-target is not a hard memory bound. Index construction retains one separator per
-leaf before building parent levels, so its memory also grows with index size.
+target is not a hard memory bound. Each index builder holds separators for one partition (at most 1024 entries)
+and bounded routing metadata. `max_index_partitions` defaults to 65,536 and
+admits routes before creating extra trees. A checkpoint still visits routing
+metadata; compaction repacks all index trees and can rewrite all live history.
+For sparse histories, one entity can occupy several routing entries; raise the
+limit explicitly when needed. This limit is distinct from cache and payload-file
+budgets.
 `events` returns an allocated vector. Large histories can therefore be expensive
 despite indexed historical reads.
 

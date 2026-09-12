@@ -167,19 +167,23 @@ impl ReadState {
     pub(crate) fn visit_entries(
         &self,
         table: TableId,
+        visit: impl FnMut(u64, Option<index::Value>) -> Result<()>,
+    ) -> Result<()> {
+        self.visit_entries_range(table, 0, u64::MAX, visit)
+    }
+    pub(crate) fn visit_entries_range(
+        &self,
+        table: TableId,
+        lower: u64,
+        upper: u64,
         mut visit: impl FnMut(u64, Option<index::Value>) -> Result<()>,
     ) -> Result<()> {
         let disk: Box<dyn Iterator<Item = Result<(u64, index::Value)>>> =
             if self.root.catalog.contains_key(&table) {
                 Box::new(
-                    index::scan(
-                        &self.pager,
-                        self.root.file(table, 3),
-                        self.root.lsn,
-                        [0, 0],
-                        [u64::MAX, u64::MAX],
-                    )?
-                    .map(|entry| entry.map(|(key, value)| (key[0], value))),
+                    self.root
+                        .scan_index(&self.pager, table, 3, [lower, 0], [upper, u64::MAX])?
+                        .map(|entry| entry.map(|(key, value)| (key[0], value))),
                 )
             } else {
                 Box::new(std::iter::empty())
@@ -187,7 +191,7 @@ impl ReadState {
         let mut disk = disk.peekable();
         let mut recent = self
             .overlay
-            .range((table, 0)..=(table, u64::MAX))
+            .range((table, lower)..=(table, upper))
             .map(|(&(t, id), _)| {
                 debug_assert_eq!(t, table);
                 id

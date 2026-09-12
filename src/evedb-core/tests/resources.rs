@@ -162,6 +162,10 @@ fn recovery_does_not_reject_acknowledged_writes_when_limits_are_lowered() {
 #[test]
 fn checkpoint_pin_byte_limit_is_checked_without_leaking_a_permit() {
     let dir = baseline();
+    let mut owner = Database::open(&dir.0).unwrap();
+    owner.create(1, 1, fields(1)).unwrap();
+    owner.checkpoint().unwrap();
+    drop(owner);
     let db = SharedDatabase::open_with_options(
         &dir.0,
         options(Limits {
