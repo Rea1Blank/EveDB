@@ -210,6 +210,7 @@ pub struct Event {
 
 #[derive(Clone)]
 pub(crate) struct EntityData {
+    pub charges: crate::ordered_map::OrderedMap<u64, std::sync::Arc<crate::resources::Reservation>>,
     pub current: Entity,
     pub base: Entity,
     // Only this transaction's new events are mutable. Published payloads are shared.

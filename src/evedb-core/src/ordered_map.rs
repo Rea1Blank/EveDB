@@ -48,6 +48,9 @@ impl<K, V> OrderedMap<K, V> {
     }
 }
 impl<K: Ord + Clone, V: Clone> OrderedMap<K, V> {
+    pub fn remove(&mut self, key: &K) {
+        self.root = remove(&self.root, key);
+    }
     pub fn floor(&self, key: &K) -> Option<(&K, &V)> {
         let mut current = self.root.as_deref();
         let mut result = None;
@@ -103,6 +106,37 @@ impl<K: Ord + Clone, V: Clone> OrderedMap<K, V> {
             Bound::Unbounded => Bound::Unbounded,
         };
         Range { stack, end }
+    }
+}
+fn remove<K: Ord + Clone, V: Clone>(root: &Link<K, V>, key: &K) -> Link<K, V> {
+    let top = root.as_ref()?;
+    match key.cmp(&top.key) {
+        Ordering::Less => Some(join(
+            remove(&top.left, key),
+            top.key.clone(),
+            top.value.clone(),
+            top.right.clone(),
+        )),
+        Ordering::Greater => Some(join(
+            top.left.clone(),
+            top.key.clone(),
+            top.value.clone(),
+            remove(&top.right, key),
+        )),
+        Ordering::Equal => {
+            let Some(mut next) = top.right.as_deref() else {
+                return top.left.clone();
+            };
+            while let Some(left) = next.left.as_deref() {
+                next = left;
+            }
+            Some(join(
+                top.left.clone(),
+                next.key.clone(),
+                next.value.clone(),
+                remove(&top.right, &next.key),
+            ))
+        }
     }
 }
 fn join<K: Clone, V: Clone>(
@@ -377,4 +411,24 @@ mod tests {
         map.clear();
         assert!(old.get(&9999).is_some());
     }
+}
+#[test]
+fn arbitrary_removal_preserves_old_roots_and_order() {
+    let mut map = OrderedMap::new();
+    for key in 0..2048 {
+        map.insert(key, key);
+    }
+    let old = map.clone();
+    for key in (0..2048).step_by(3) {
+        map.remove(&key);
+    }
+    assert_eq!(
+        map.range(..).map(|(key, _)| *key).collect::<Vec<_>>(),
+        (0..2048).filter(|key| key % 3 != 0).collect::<Vec<_>>()
+    );
+    assert_eq!(old.range(..).count(), 2048);
+    for key in 0..2048 {
+        map.remove(&key);
+    }
+    assert_eq!(map.range(..).count(), 0);
 }

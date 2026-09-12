@@ -39,6 +39,184 @@ fn wait_queued(db: &SharedDatabase, count: usize) {
         thread::yield_now();
     }
 }
+
+#[test]
+fn frozen_checkpoint_preserves_newer_writes_catalog_and_old_history_through_recovery() {
+    let (dir, db, table) = setup(crate::Limits::default(), crate::GroupCommit::default());
+    db.create(table, 1, [(1, Value::UInt64(1))].into()).unwrap();
+    db.checkpoint().unwrap();
+    let old = db.read_snapshot().unwrap();
+    db.apply(table, 1, [(1, Value::UInt64(2))].into()).unwrap();
+    let job = db
+        .coordinator
+        .lock()
+        .unwrap()
+        .database
+        .capture_checkpoint(true)
+        .unwrap();
+    let frontier = db.sequence().unwrap();
+    // The builder is deliberately paused. These commits must finish before it resumes.
+    let other = db.clone();
+    thread::spawn(move || {
+        other
+            .apply(table, 1, [(1, Value::UInt64(3))].into())
+            .unwrap();
+        other
+            .create(table, 2, [(1, Value::UInt64(20))].into())
+            .unwrap();
+        other.write(|tx| tx.rename_table(table, "renamed")).unwrap();
+    })
+    .join()
+    .unwrap();
+    let during = db.read_snapshot().unwrap();
+    let built = job.build().unwrap();
+    db.coordinator
+        .lock()
+        .unwrap()
+        .database
+        .install_checkpoint(built)
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(db.sequence().unwrap(), frontier + 3);
+    assert_eq!(
+        db.get(table, 1).unwrap().unwrap().fields[&1],
+        Value::UInt64(3)
+    );
+    assert_eq!(db.reader().events(table, 1).unwrap().len(), 2);
+    db.compact().unwrap();
+    db.checkpoint().unwrap();
+    assert_eq!(
+        old.get(table, 1).unwrap().unwrap().fields[&1],
+        Value::UInt64(1)
+    );
+    assert_eq!(during.events(table, 1).unwrap().len(), 2);
+    drop(old);
+    drop(during);
+    drop(db);
+    let db = SharedDatabase::open(&dir.0).unwrap();
+    assert_eq!(db.reader().table("renamed").unwrap().unwrap().id, table);
+    assert_eq!(db.reader().events(table, 1).unwrap().len(), 2);
+    assert!(db.get(table, 2).unwrap().is_some());
+}
+
+#[test]
+fn abandoned_checkpoint_rotation_recovers_tail_and_wal_admission_resumes_after_checkpoint() {
+    let limits = crate::Limits {
+        max_uncheckpointed_wal_bytes: 350,
+        ..crate::Limits::default()
+    };
+    let (dir, db, table) = setup(limits, crate::GroupCommit::default());
+    db.create(table, 1, [(1, Value::UInt64(1))].into()).unwrap();
+    let job = db
+        .coordinator
+        .lock()
+        .unwrap()
+        .database
+        .capture_checkpoint(false)
+        .unwrap();
+    db.apply(table, 1, [(1, Value::UInt64(2))].into()).unwrap();
+    assert!(matches!(
+        db.apply(table, 1, [(1, Value::UInt64(3))].into()),
+        Err(Error::LimitExceeded {
+            resource: "uncheckpointed WAL bytes",
+            ..
+        })
+    ));
+    drop(job);
+    drop(db);
+    let db = SharedDatabase::open(&dir.0).unwrap();
+    assert_eq!(db.reader().events(table, 1).unwrap().len(), 1);
+    db.checkpoint().unwrap();
+    db.apply(table, 1, [(1, Value::UInt64(3))].into()).unwrap();
+}
+
+#[test]
+fn background_jobs_are_coalesced_and_report_build_errors() {
+    let (dir, db, _) = setup(crate::Limits::default(), crate::GroupCommit::default());
+    let guard = db.coordinator.lock().unwrap();
+    assert!(db.checkpoint_background(false).unwrap());
+    assert!(!db.checkpoint_background(true).unwrap());
+    drop(guard);
+    db.wait_for_maintenance().unwrap();
+    // A deterministic capture failure is reported to the waiting caller.
+    std::fs::write(
+        dir.0.join("catalog/00000000000000000002.catalog"),
+        b"occupied",
+    )
+    .unwrap();
+    assert!(db.checkpoint_background(false).unwrap());
+    assert!(db.wait_for_maintenance().is_err());
+    db.checkpoint().unwrap();
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn maintenance_crash_child() {
+    let Ok(path) = std::env::var("EVEDB_MAINTENANCE_CHILD") else {
+        return;
+    };
+    let db = SharedDatabase::open(path).unwrap();
+    db.apply(1, 1, [(1, Value::UInt64(2))].into()).unwrap();
+    let job = db
+        .coordinator
+        .lock()
+        .unwrap()
+        .database
+        .capture_checkpoint(true)
+        .unwrap();
+    db.apply(1, 1, [(1, Value::UInt64(3))].into()).unwrap();
+    let built = job.build().unwrap();
+    db.coordinator
+        .lock()
+        .unwrap()
+        .database
+        .install_checkpoint(built)
+        .unwrap()
+        .run()
+        .unwrap();
+}
+
+#[test]
+#[cfg(feature = "fault-injection")]
+fn crashes_during_background_publication_recover_commits_after_the_frozen_frontier() {
+    for point in [
+        "checkpoint-files",
+        "checkpoint-catalog",
+        "checkpoint-wal-partial",
+        "checkpoint-published",
+        "checkpoint-cleanup",
+    ] {
+        let (dir, db, table) = setup(crate::Limits::default(), crate::GroupCommit::default());
+        db.create(table, 1, [(1, Value::UInt64(1))].into()).unwrap();
+        db.checkpoint().unwrap();
+        drop(db);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "shared::group_tests::maintenance_crash_child",
+                "--nocapture",
+            ])
+            .env("EVEDB_MAINTENANCE_CHILD", &dir.0)
+            .env("EVEDB_FAILPOINT", point)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(91),
+            "{point}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let db = SharedDatabase::open(&dir.0).unwrap();
+        assert_eq!(
+            db.get(table, 1).unwrap().unwrap().fields[&1],
+            Value::UInt64(3),
+            "{point}"
+        );
+        assert_eq!(db.reader().events(table, 1).unwrap().len(), 2, "{point}");
+        db.compact().unwrap();
+    }
+}
 #[test]
 fn concurrent_writers_share_one_sync_keep_individual_frames_and_recover() {
     let (dir, db, table) = setup(crate::Limits::default(), crate::GroupCommit::default());
@@ -328,6 +506,7 @@ fn automatic_checkpoints_prune_revisions_but_preserve_live_writer_conflicts() {
         db.create(table, id, [(1, Value::UInt64(id))].into())
             .unwrap();
     }
+    db.wait_for_maintenance().unwrap();
     assert!(
         db.coordinator
             .lock()
@@ -341,6 +520,7 @@ fn automatic_checkpoints_prune_revisions_but_preserve_live_writer_conflicts() {
         db.create(table, id, [(1, Value::UInt64(id))].into())
             .unwrap();
     }
+    db.wait_for_maintenance().unwrap();
     let coordinator = db.coordinator.lock().unwrap();
     assert!(
         coordinator.revisions.len() < 100,
