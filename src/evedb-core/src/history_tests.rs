@@ -15,6 +15,61 @@ fn fields(byte: u8, size: usize) -> Fields {
 }
 
 #[test]
+fn streaming_detects_missing_versions_and_stops_cooperatively_between_records() {
+    let dir = TempDir::new();
+    let mut db = Database::open(&dir.0).unwrap();
+    let table = db.create_table("items", schema()).unwrap();
+    db.create(table, 1, fields(0, 8)).unwrap();
+    for i in 1..=4 {
+        db.apply(table, 1, fields(i, 8)).unwrap();
+    }
+    let mut damaged = (**db.state.overlay.get(&(table, 1)).unwrap()).clone();
+    damaged.committed.remove(&2);
+    let healthy = db.state.clone();
+    Arc::make_mut(&mut db.state)
+        .overlay
+        .insert((table, 1), Arc::new(damaged));
+    db.readers.publish(db.state.clone());
+    let mut cursor = db
+        .history(table, 1, crate::HistoryOptions::default())
+        .unwrap();
+    assert!(matches!(cursor.next_batch(), Err(Error::Corrupt(_))));
+    assert_eq!(db.resource_usage().read_memory_bytes, 0);
+    assert_eq!(db.resource_usage().snapshots, 0);
+    db.state = healthy;
+    db.readers.publish(db.state.clone());
+    db.checkpoint().unwrap();
+    let mut checks = 0;
+    let mut events = Vec::new();
+    let result = db.state.root.visit_events(
+        &db.state.pager,
+        table,
+        1,
+        1,
+        4,
+        &mut || {
+            checks += 1;
+            if checks == 2 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        },
+        &mut |_| Ok(true),
+        &mut |event| {
+            events.push(event);
+            Ok(true)
+        },
+    );
+    assert!(matches!(result, Err(Error::Cancelled)));
+    assert_eq!(events.len(), 1);
+    assert!(db.resource_usage().read_memory_bytes > 0);
+    drop(events);
+    assert_eq!(db.resource_usage().read_memory_bytes, 0);
+    assert_eq!(db.resource_usage().scratch_bytes, 0);
+}
+
+#[test]
 fn unchanged_primary_and_history_partitions_keep_their_files_and_survive_slot_remapping() {
     let dir = TempDir::new();
     let mut db = Database::open_with_options(

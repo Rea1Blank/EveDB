@@ -146,7 +146,9 @@ fails before publication. Prefix trimming/floor queries are checked against an
 ordered model with tree balance and old-root invariants.
 
 Remaining costs are explicit: local synchronous maintenance, routing-metadata traversal,
-whole-file startup verification, caller-owned results and decoded-record memory.
+whole-file startup verification, caller-managed allocations, and reconstruction
+intermediates outside the decoded working-buffer pools. See
+[bounded reads](bounded-reads.md) for the added decoded and scratch admission.
 These changes remove major write amplification paths; they do not establish a
 production RPS claim. External metrics, load qualification,
 network serving, additional isolation levels, backup/upgrades and platform

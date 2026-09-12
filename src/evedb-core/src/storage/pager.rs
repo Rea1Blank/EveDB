@@ -123,13 +123,46 @@ pub(crate) struct PagerStats {
 
 /// A bounded cache of decoded pages and open descriptors over immutable files.
 pub(crate) struct Pager {
+    pub resources: Option<Arc<crate::resources::Resources>>,
+    pub recovering: std::sync::atomic::AtomicBool,
     directory: PathBuf,
     files: Mutex<FileCache>,
     pages: Mutex<PageCache>,
 }
 impl Pager {
+    pub fn scratch(&self, bytes: usize) -> Result<Option<crate::resources::MemoryReservation>> {
+        self.resources
+            .as_ref()
+            .map(|r| {
+                r.memory(
+                    crate::resources::MemoryKind::Scratch,
+                    bytes,
+                    self.recovering.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+            .transpose()
+    }
+    pub fn decoded(&self, bytes: usize) -> Result<Option<crate::resources::MemoryReservation>> {
+        let recovery = self.recovering.load(std::sync::atomic::Ordering::Relaxed);
+        self.resources
+            .as_ref()
+            .map(|r| {
+                if !recovery {
+                    crate::resources::check(
+                        "decoded record bytes",
+                        0,
+                        bytes,
+                        r.limits.max_decoded_record_bytes,
+                    )?;
+                }
+                r.memory(crate::resources::MemoryKind::Read, bytes, recovery)
+            })
+            .transpose()
+    }
     pub fn new(directory: PathBuf, cache_bytes: usize, max_open_files: usize) -> Self {
         Self {
+            resources: None,
+            recovering: std::sync::atomic::AtomicBool::new(false),
             directory,
             files: Mutex::new(FileCache {
                 open: HashMap::new(),

@@ -1,14 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Admission and ownership-based accounting of accepted mutation bytes.
+//! Admission and ownership-based accounting for writes, reads, and scratch buffers.
 
 use crate::{Error, Result, codec::MAX_FRAME};
 use std::sync::{Arc, Mutex};
 
-/// Engine admission limits. Byte limits count encoded mutations, not process RSS.
-/// Page caches, decoded records and allocator overhead have separate costs.
+/// Engine admission limits with separate encoded, decoded, and scratch budgets.
+/// Decoded charges include a per-field allowance and do not measure process RSS.
 #[derive(Clone, Debug)]
 pub struct Limits {
+    /// Logical decoded bytes in one entity or event (including per-field allowance).
+    pub max_decoded_record_bytes: usize,
+    /// Logical decoded allocations admitted by one transaction.
+    pub max_transaction_decoded_bytes: usize,
+    /// Decoded transaction charges retained by staging, queued commits, and views.
+    pub max_resident_decoded_write_bytes: usize,
+    /// Decoded read buffers and returned history batches retained by the engine.
+    pub max_read_memory_bytes: usize,
+    /// Concurrent raw record and decompression scratch buffers.
+    pub max_scratch_bytes: usize,
+    /// Maximum logical size of the compatibility events() collector.
+    pub max_read_result_bytes: usize,
+    /// Maximum history events admitted in one batch.
+    pub max_history_batch_events: usize,
+    /// Maximum logical history-batch size, including its event slots.
+    pub max_history_batch_bytes: usize,
     /// Simultaneously active transactions, including queued commits.
     pub max_transactions: usize,
     /// Independently pinned snapshots; clones share a pin.
@@ -36,6 +52,14 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            max_decoded_record_bytes: 64 * 1024 * 1024,
+            max_transaction_decoded_bytes: 256 * 1024 * 1024,
+            max_resident_decoded_write_bytes: 1024 * 1024 * 1024,
+            max_read_memory_bytes: 256 * 1024 * 1024,
+            max_scratch_bytes: 128 * 1024 * 1024,
+            max_read_result_bytes: 64 * 1024 * 1024,
+            max_history_batch_events: 4096,
+            max_history_batch_bytes: 64 * 1024 * 1024,
             max_transactions: 1024,
             max_snapshots: 4096,
             max_pinned_bytes: 8 * 1024 * 1024 * 1024usize,
@@ -52,7 +76,15 @@ impl Default for Limits {
 }
 impl Limits {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.max_uncheckpointed_wal_bytes == 0
+        if self.max_decoded_record_bytes == 0
+            || self.max_transaction_decoded_bytes == 0
+            || self.max_resident_decoded_write_bytes < self.max_transaction_decoded_bytes
+            || self.max_read_memory_bytes == 0
+            || self.max_scratch_bytes == 0
+            || self.max_read_result_bytes == 0
+            || self.max_history_batch_events == 0
+            || self.max_history_batch_bytes == 0
+            || self.max_uncheckpointed_wal_bytes == 0
             || self.max_transactions == 0
             || self.max_history_files == 0
             || self.max_index_partitions == 0
@@ -73,6 +105,12 @@ impl Limits {
 /// Current admission counters, useful for enforcing and diagnosing limits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResourceUsage {
+    /// Logical decoded transaction bytes retained by accepted writes and views.
+    pub decoded_write_bytes: usize,
+    /// Decoded read allocations, including batches that callers still own.
+    pub read_memory_bytes: usize,
+    /// Raw/decompression buffers currently retained by reads.
+    pub scratch_bytes: usize,
     /// Active transactions, including requests waiting for commit.
     pub transactions: usize,
     /// Independent live snapshot pins.
@@ -140,6 +178,7 @@ impl Resources {
         Reservation {
             resources: self.clone(),
             bytes: 0,
+            decoded_bytes: 0,
         }
     }
 }
@@ -166,8 +205,33 @@ impl Drop for Permit {
 pub(crate) struct Reservation {
     resources: Arc<Resources>,
     pub bytes: usize,
+    pub decoded_bytes: usize,
 }
 impl Reservation {
+    pub fn grow_decoded(&mut self, bytes: usize, recovery: bool) -> Result<()> {
+        let mut usage = self
+            .resources
+            .usage
+            .lock()
+            .map_err(|_| Error::NeedsRecovery)?;
+        if !recovery {
+            check(
+                "transaction decoded bytes",
+                self.decoded_bytes,
+                bytes,
+                self.resources.limits.max_transaction_decoded_bytes,
+            )?;
+            check(
+                "resident decoded write bytes",
+                usage.decoded_write_bytes,
+                bytes,
+                self.resources.limits.max_resident_decoded_write_bytes,
+            )?;
+        }
+        usage.decoded_write_bytes += bytes;
+        self.decoded_bytes += bytes;
+        Ok(())
+    }
     pub fn recover(&mut self, bytes: usize) {
         self.resources
             .usage
@@ -195,11 +259,71 @@ impl Reservation {
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.resources
+        let mut usage = self.resources.usage.lock().expect("resource accounting");
+        usage.resident_write_bytes -= self.bytes;
+        usage.decoded_write_bytes -= self.decoded_bytes;
+    }
+}
+#[derive(Clone, Copy)]
+pub(crate) enum MemoryKind {
+    Read,
+    Scratch,
+}
+pub(crate) struct MemoryReservation {
+    resources: Arc<Resources>,
+    kind: MemoryKind,
+    pub bytes: usize,
+}
+impl Resources {
+    pub fn memory(
+        self: &Arc<Self>,
+        kind: MemoryKind,
+        bytes: usize,
+        recovery: bool,
+    ) -> Result<MemoryReservation> {
+        let mut memory = MemoryReservation {
+            resources: self.clone(),
+            kind,
+            bytes: 0,
+        };
+        memory.grow(bytes, recovery)?;
+        Ok(memory)
+    }
+}
+impl MemoryReservation {
+    pub fn grow(&mut self, bytes: usize, recovery: bool) -> Result<()> {
+        let mut usage = self
+            .resources
             .usage
             .lock()
-            .expect("resource accounting")
-            .resident_write_bytes -= self.bytes;
+            .map_err(|_| Error::NeedsRecovery)?;
+        let (used, limit, name) = match self.kind {
+            MemoryKind::Read => (
+                &mut usage.read_memory_bytes,
+                self.resources.limits.max_read_memory_bytes,
+                "decoded read bytes",
+            ),
+            MemoryKind::Scratch => (
+                &mut usage.scratch_bytes,
+                self.resources.limits.max_scratch_bytes,
+                "scratch bytes",
+            ),
+        };
+        if !recovery {
+            check(name, *used, bytes, limit)?;
+        }
+        *used += bytes;
+        self.bytes += bytes;
+        Ok(())
+    }
+}
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        let mut usage = self.resources.usage.lock().expect("memory accounting");
+        match self.kind {
+            MemoryKind::Read => usage.read_memory_bytes -= self.bytes,
+            MemoryKind::Scratch => usage.scratch_bytes -= self.bytes,
+        }
     }
 }
 pub(crate) fn check(

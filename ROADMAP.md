@@ -149,4 +149,7 @@ Stage 1 implements background shared checkpoint/compaction with a frozen WAL
 frontier, bounded job admission, and an uncheckpointed transaction-WAL limit.
 Stage 2 implements packed, disjoint index partitions with direct root routing,
 unchanged-partition reuse, slot translation, and bounded routing admission.
-Stage 3 (bounded streaming reads) follows separately.
+Stage 3 implements snapshot history cursors, cancellation, bounded batches and
+collectors, decoded write/read budgets, and raw/decompression scratch admission.
+See [bounded reads](docs/bounded-reads.md). All three stages are implemented;
+metrics and sustained throughput qualification remain deferred.

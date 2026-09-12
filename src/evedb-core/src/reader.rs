@@ -73,7 +73,12 @@ impl ReadState {
         self.ready()?;
         self.definition(table)?;
         let current = match self.overlay.get(&(table, id)) {
-            Some(data) => Some(data.current.clone()),
+            Some(data) => {
+                let _memory = self
+                    .pager
+                    .decoded(crate::memory::entity_bytes(&data.current))?;
+                Some(data.current.clone())
+            }
             None => self.root.current(&self.pager, table, id)?,
         };
         Ok(current.filter(|entity| !entity.deleted))
@@ -109,12 +114,25 @@ impl ReadState {
         }
         self.root.at(&self.pager, table, id, version, false)
     }
-    /// Returns retained events in entity-version order.
-    pub fn events(&self, table: TableId, id: u64) -> Result<Vec<Event>> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn visit_events(
+        &self,
+        table: TableId,
+        id: u64,
+        first: u64,
+        last: u64,
+        check: &mut impl FnMut() -> Result<()>,
+        admit: &mut impl FnMut(usize) -> Result<bool>,
+        visit: &mut impl FnMut(crate::memory::Accounted<Event>) -> Result<bool>,
+    ) -> Result<bool> {
         self.ready()?;
-        self.load(table, id)?
-            .ok_or_else(|| Error::NotFound(format!("entity {id}")))?
-            .all_events()
+        self.definition(table)?;
+        if let Some(data) = self.overlay.get(&(table, id)) {
+            data.visit_events(&self.pager, first, last, check, admit, visit)
+        } else {
+            self.root
+                .visit_events(&self.pager, table, id, first, last, check, admit, visit)
+        }
     }
     /// Returns the inclusive range of reconstructible entity versions.
     pub fn retained_range(&self, table: TableId, id: u64) -> Result<(u64, u64)> {
@@ -152,11 +170,27 @@ impl ReadState {
             .ok_or_else(|| Error::NotFound(format!("table {id}")))
     }
     pub(crate) fn load(&self, table: TableId, id: u64) -> Result<Option<EntityData>> {
+        self.load_charged(table, id, &mut |_| Ok(()))
+    }
+    pub(crate) fn load_charged(
+        &self,
+        table: TableId,
+        id: u64,
+        charge: &mut impl FnMut(usize) -> Result<()>,
+    ) -> Result<Option<EntityData>> {
         self.definition(table)?;
         if let Some(data) = self.overlay.get(&(table, id)) {
+            let size = crate::memory::entity_bytes(&data.current)
+                + crate::memory::entity_bytes(&data.base);
+            let _memory = self.resources.memory(
+                crate::resources::MemoryKind::Read,
+                size,
+                self.pager.recovering.load(Ordering::Relaxed),
+            )?;
+            charge(size)?;
             return Ok(Some((**data).clone()));
         }
-        self.root.entity(&self.pager, table, id)
+        self.root.entity_charged(&self.pager, table, id, charge)
     }
     /// Visits every live identifier of a table in order, merging disk and overlay.
     ///
@@ -406,7 +440,7 @@ impl ReadSnapshot {
     pub(crate) fn state(&self) -> Result<Arc<SnapshotData>> {
         self.pin.with(|data| Ok(data.clone()))
     }
-    fn with_state<R>(
+    pub(crate) fn with_state<R>(
         &self,
         operation: impl FnOnce(&ReadState, std::time::Instant) -> Result<R>,
     ) -> Result<R> {
@@ -448,7 +482,7 @@ impl ReadSnapshot {
     }
     /// See [`Database::events`](crate::Database::events); uses this pinned view.
     pub fn events(&self, table: TableId, id: u64) -> Result<Vec<Event>> {
-        self.with_state(|state, _| state.events(table, id))
+        crate::cursor::collect(self, table, id)
     }
     /// See [`Database::retained_range`](crate::Database::retained_range); uses this pinned view.
     pub fn retained_range(&self, table: TableId, id: u64) -> Result<(u64, u64)> {

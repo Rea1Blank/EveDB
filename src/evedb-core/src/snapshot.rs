@@ -472,9 +472,25 @@ impl Root {
         locator: u64,
         id: u64,
     ) -> Result<Entity> {
+        self.state_charged(pager, table, kind, locator, id, &mut |_| Ok(()))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn state_charged(
+        &self,
+        pager: &Pager,
+        table: TableId,
+        kind: u8,
+        locator: u64,
+        id: u64,
+        charge: &mut impl FnMut(usize) -> Result<()>,
+    ) -> Result<Entity> {
         let (slot, location) = heap::split(locator);
         let (file, lsn) = self.slotted(table, kind, slot, 0)?;
-        let entity = decode_entity(&heap::read(pager, file, location, lsn)?)?;
+        let raw = heap::read_buffer(pager, file, location, lsn)?;
+        let size = crate::memory::record_bytes(&raw, std::mem::size_of::<Entity>())?;
+        let _memory = pager.decoded(size)?;
+        charge(size)?;
+        let entity = decode_entity(&raw)?;
         if entity.id != id {
             return Err(corrupt("index references another entity"));
         }
@@ -486,20 +502,46 @@ impl Root {
         pager: &Pager,
         table: TableId,
         location: index::Value,
-    ) -> Result<(u64, Event, u64)> {
+    ) -> Result<(u64, crate::memory::Accounted<Event>, u64)> {
+        self.event_at_if(pager, table, location, &mut |_| Ok(true))?
+            .ok_or_else(|| corrupt("event admission unexpectedly stopped"))
+    }
+    fn event_at_if(
+        &self,
+        pager: &Pager,
+        table: TableId,
+        location: index::Value,
+        admit: &mut impl FnMut(usize) -> Result<bool>,
+    ) -> Result<Option<(u64, crate::memory::Accounted<Event>, u64)>> {
         if !self.history_generations.contains_key(&location[0]) {
             return Err(corrupt("absent history generation"));
         }
         let (segment, offset) = event_split(location[1]);
         let id = FileId::new(table, location[0], 6, segment);
         let file = pager.file(id)?;
+        let _raw_memory = pager.scratch(frame::payload_size_at(&file.file, offset, file.len)?)?;
         let record = frame::read_at(&file.file, offset, file.len)?
             .ok_or_else(|| corrupt("truncated indexed event"))?;
         if record.kind != 3 {
             return Err(corrupt("invalid history frame kind"));
         }
-        let (entity_id, payload) = unpack(&record.payload)?;
-        Ok((entity_id, decode_event(&payload)?, record.lsn))
+        let (entity_id, payload) = unpack(&record.payload, pager)?;
+        let size = crate::memory::record_bytes(
+            &payload,
+            std::mem::size_of::<crate::memory::Accounted<Event>>(),
+        )?;
+        if !admit(size)? {
+            return Ok(None);
+        }
+        let memory = pager.decoded(size)?;
+        Ok(Some((
+            entity_id,
+            crate::memory::Accounted {
+                value: decode_event(&payload)?,
+                memory,
+            },
+            record.lsn,
+        )))
     }
     pub fn at(
         &self,
@@ -584,32 +626,41 @@ impl Root {
             .history_generations
             .get(&location[0])
             .ok_or_else(|| corrupt("absent snapshot generation"))?;
-        let entity = decode_entity(&heap::read(
+        let raw = heap::read_buffer(
             pager,
             FileId::new(table, location[0], 2, 0),
             location[1],
             *lsn,
+        )?;
+        let _memory = pager.decoded(crate::memory::record_bytes(
+            &raw,
+            std::mem::size_of::<Entity>(),
         )?)?;
+        let entity = decode_entity(&raw)?;
         if entity.id != id {
             return Err(corrupt("snapshot references another entity"));
         }
         Ok(entity)
     }
-    pub fn events(
+    #[allow(clippy::too_many_arguments)]
+    pub fn visit_events(
         &self,
         pager: &Pager,
         table: TableId,
         id: u64,
         first: u64,
         last: u64,
-    ) -> Result<Vec<Event>> {
-        let mut events = Vec::new();
-        if first > last {
-            return Ok(events);
-        }
+        check: &mut impl FnMut() -> Result<()>,
+        admit: &mut impl FnMut(usize) -> Result<bool>,
+        visit: &mut impl FnMut(crate::memory::Accounted<Event>) -> Result<bool>,
+    ) -> Result<bool> {
         for item in self.scan_index(pager, table, 4, [id, first], [id, last])? {
+            check()?;
             let (key, location) = item?;
-            let (entity_id, event, lsn) = self.event_at(pager, table, location)?;
+            let Some((entity_id, event, lsn)) = self.event_at_if(pager, table, location, admit)?
+            else {
+                return Ok(false);
+            };
             if entity_id != id
                 || event.version != key[1]
                 || event.transaction != lsn
@@ -617,9 +668,11 @@ impl Root {
             {
                 return Err(corrupt("history index references another event"));
             }
-            events.push(event);
+            if !visit(event)? {
+                return Ok(false);
+            }
         }
-        Ok(events)
+        Ok(true)
     }
     pub fn entity(
         self: &Arc<Self>,
@@ -627,11 +680,20 @@ impl Root {
         table: TableId,
         id: u64,
     ) -> Result<Option<EntityData>> {
+        self.entity_charged(pager, table, id, &mut |_| Ok(()))
+    }
+    pub fn entity_charged(
+        self: &Arc<Self>,
+        pager: &Arc<Pager>,
+        table: TableId,
+        id: u64,
+        charge: &mut impl FnMut(usize) -> Result<()>,
+    ) -> Result<Option<EntityData>> {
         let Some((_, value)) = self.locate(pager, table, id)? else {
             return Ok(None);
         };
-        let current = self.state(pager, table, 0, value[0], id)?;
-        let base = self.state(pager, table, 1, value[1], id)?;
+        let current = self.state_charged(pager, table, 0, value[0], id, charge)?;
+        let base = self.state_charged(pager, table, 1, value[1], id, charge)?;
         if base.version > current.version {
             return Err(corrupt("invalid current/base reference"));
         }
@@ -718,7 +780,7 @@ fn pack(id: u64, bytes: &[u8], compress: bool) -> Vec<u8> {
     result.extend(if use_rle { &encoded } else { bytes });
     result
 }
-fn unpack(bytes: &[u8]) -> Result<(u64, Vec<u8>)> {
+fn unpack(bytes: &[u8], pager: &Pager) -> Result<(u64, crate::memory::Accounted<Vec<u8>>)> {
     if bytes.len() < 13 {
         return Err(corrupt("short history record"));
     }
@@ -727,6 +789,10 @@ fn unpack(bytes: &[u8]) -> Result<(u64, Vec<u8>)> {
     if size > MAX_RECORD {
         return Err(corrupt("oversized history record"));
     }
+    if bytes[8] == 0 && bytes.len() - 13 != size {
+        return Err(corrupt("history length mismatch"));
+    }
+    let memory = pager.scratch(size)?;
     let mut result = Vec::with_capacity(size);
     match bytes[8] {
         0 => result.extend(&bytes[13..]),
@@ -747,7 +813,13 @@ fn unpack(bytes: &[u8]) -> Result<(u64, Vec<u8>)> {
     if result.len() != size {
         return Err(corrupt("history length mismatch"));
     }
-    Ok((id, result))
+    Ok((
+        id,
+        crate::memory::Accounted {
+            value: result,
+            memory,
+        },
+    ))
 }
 
 pub(crate) struct TableOutput {

@@ -310,8 +310,11 @@ metadata; compaction repacks all index trees and can rewrite all live history.
 For sparse histories, one entity can occupy several routing entries; raise the
 limit explicitly when needed. This limit is distinct from cache and payload-file
 budgets.
-`events` returns an allocated vector. Large histories can therefore be expensive
-despite indexed historical reads.
+`history` streams a pinned version range in count/byte bounded batches with
+cancellation and deadlines. `events` remains an owned-vector compatibility API
+with a result-size limit. Decoded transaction allocations, read buffers/batches,
+and raw/decompression scratch have separate admission budgets; see
+[bounded reads](bounded-reads.md) for the precise accounting and ownership limits.
 
 At most one shared maintenance job runs. `checkpoint_background(compact)`
 coalesces overlapping requests; `wait_for_maintenance()` reports completion or

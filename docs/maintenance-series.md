@@ -41,3 +41,12 @@ partitions keep their original file and page; compaction packs them again.
 `max_index_partitions` bounds metadata before extra trees are created. Recovery
 and snapshot reclamation retain every routed index file and payload dependency.
 Older format markers are rejected without migration or modification.
+
+## Stage 3 implementation
+
+The history cursor exposes inclusive event-version ranges, count/byte bounded
+batches, cancellation, and operation/snapshot deadlines. Batch ownership carries
+read-memory reservations, while raw/decompression scratch and decoded transaction
+allocations have separate budgets. The compatibility collector is result bounded.
+See [bounded reads](bounded-reads.md) for the API, defaults, ownership boundary,
+recovery exemption, and the distinction between logical accounting and RSS.
